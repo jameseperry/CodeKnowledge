@@ -17,6 +17,7 @@ dependencies = [
     "numpy>=1.24.0",
     "httpx>=0.27.0",
     "einops>=0.7.0",
+    "fastmcp>=3.2.0",
 ]
 
 [tool.setuptools.packages.find]
@@ -24,3 +25,4 @@ where = ["src"]
 
 [project.scripts]
 codeknowledge = "codeknowledge.cli:cli"
+codeknowledge-mcp = "codeknowledge.server:main"
