@@ -1080,5 +1080,556 @@ def search(
             click.echo(f"      {preview}")
 
 
+# ---------------------------------------------------------------------------
+# update — orchestrated full-pipeline run
+# ---------------------------------------------------------------------------
+
+def _box(text: str, width: int = 40) -> str:
+    """Draw a Unicode box around text."""
+    inner = f"  {text}  "
+    pad = width - 2
+    if len(inner) < pad:
+        inner = inner + " " * (pad - len(inner))
+    return (
+        f"╭{'─' * pad}╮\n"
+        f"│{inner}│\n"
+        f"╰{'─' * pad}╯"
+    )
+
+
+def _step_line(step: int, total: int, name: str, status: str, detail: str = "") -> str:
+    """Format a step progress line."""
+    bar_width = 18
+    if status == "done":
+        bar = "━" * bar_width
+        icon = "✓"
+    elif status == "running":
+        bar = "━" * (bar_width // 2) + "╸" + " " * (bar_width // 2 - 1)
+        icon = "…"
+    elif status == "skip":
+        bar = "─" * bar_width
+        icon = "–"
+    else:
+        bar = " " * bar_width
+        icon = " "
+    suffix = f"  {detail}" if detail else ""
+    return f"[{step}/{total}] {name:<12s} {bar} {icon}{suffix}"
+
+
+@cli.command()
+@click.argument("path", type=click.Path(exists=True), required=False, default=None)
+@click.option("--repo-root", type=click.Path(exists=True), default=None,
+              help="Repository root for relative paths.")
+@click.option("--model", default=None, help="Model tier: haiku, sonnet, opus, or a model name.")
+@click.option("--force", is_flag=True, help="Regenerate all content, ignoring caches.")
+@click.option("--skip-flows", is_flag=True, help="Skip flow document generation.")
+@click.option("--skip-step", multiple=True, type=click.Choice(
+    ["extract", "graph", "describe", "synthesize", "index"]),
+    help="Skip a step. Repeatable.")
+@click.pass_context
+def update(
+    ctx: click.Context,
+    path: str | None,
+    repo_root: str | None,
+    model: str | None,
+    force: bool,
+    skip_flows: bool,
+    skip_step: tuple[str, ...],
+) -> None:
+    """Run the full knowledge-building pipeline.
+
+    Sequentially runs: extract → graph → describe → synthesize → index.
+    Each step reuses incremental caching where possible.
+    """
+    import sqlite3
+    import time
+
+    from .describe import (
+        build_prompt, parse_response, render_description_markdown,
+        count_elements, find_missing_elements, build_continuation_prompt,
+    )
+    from .graph import build_graph, CallGraph
+    from .index import build_index
+    from .llm import describe_file
+    from .synthesize import (
+        build_architecture_prompt,
+        build_architecture_from_summaries_prompt,
+        build_flow_identification_prompt,
+        build_flow_prompt,
+        build_flow_prompt_from_skeleton,
+        build_full_skeleton,
+        build_merge_summaries_prompt,
+        build_module_summary_prompt,
+        build_significance_prompt,
+        group_by_directory,
+        needs_batching,
+        parse_article_frontmatter,
+        parse_flows,
+        parse_significance_verdict,
+        render_article,
+        split_module_batches,
+    )
+    from .git import get_head_commit, has_uncommitted_changes, get_diff, is_git_repo
+    from .config import EmbeddingConfig
+
+    t_start = time.monotonic()
+
+    # ---- Setup ----
+    target = Path(path).resolve() if path else Path.cwd().resolve()
+    root = _resolve_root(repo_root, target)
+    cfg = _load_config(root)
+    ck_dir = root / ".codeknowledge"
+
+    if not ck_dir.is_dir():
+        click.echo("No .codeknowledge/ found. Run 'codeknowledge init' first.", err=True)
+        sys.exit(1)
+
+    model_tier = model or (cfg.model if cfg else "sonnet")
+    proj = cfg.project_name if cfg else root.name
+    exclude = cfg.exclude if cfg else None
+    skip = set(skip_step)
+
+    if path is None and cfg and cfg.source_dirs:
+        targets = cfg.resolved_source_dirs()
+    else:
+        targets = [target]
+
+    steps = ["Extract", "Graph", "Describe", "Synthesize", "Index"]
+    n_steps = len(steps)
+
+    click.echo(_box(f"CodeKnowledge · {proj}"))
+    click.echo()
+
+    # Git info
+    git_available = is_git_repo(root)
+    head_commit: str | None = None
+    dirty = False
+    if git_available:
+        head_commit = get_head_commit(root)
+        dirty = has_uncommitted_changes(root)
+        if head_commit:
+            tag = " (dirty)" if dirty else ""
+            click.echo(f"  commit: {head_commit}{tag}")
+    record_commit = head_commit if (head_commit and not dirty) else None
+    click.echo()
+
+    # ---- Step 1: Extract ----
+    step = 1
+    if "extract" in skip:
+        click.echo(_step_line(step, n_steps, "Extract", "skip", "skipped"))
+    else:
+        click.echo(_step_line(step, n_steps, "Extract", "running"), nl=False)
+        t0 = time.monotonic()
+
+        extracted: list[tuple[Path, FileStructure]] = []
+        for t in targets:
+            extracted.extend(_collect_files(t, root, exclude=exclude))
+
+        if not extracted:
+            click.echo("\r" + _step_line(step, n_steps, "Extract", "done", "0 files"))
+            click.echo("No extractable files found.", err=True)
+            sys.exit(1)
+
+        files: list[tuple[FileStructure, str]] = []
+        for file_path, fs in extracted:
+            source = file_path.read_text()
+            files.append((fs, source))
+
+        dt = time.monotonic() - t0
+        click.echo("\r" + _step_line(step, n_steps, "Extract", "done",
+                                      f"{len(files)} files ({dt:.1f}s)"))
+
+    # ---- Step 2: Graph ----
+    step = 2
+    graph_dir = ck_dir / "graph"
+    if "graph" in skip:
+        click.echo(_step_line(step, n_steps, "Graph", "skip", "skipped"))
+    else:
+        click.echo(_step_line(step, n_steps, "Graph", "running"), nl=False)
+        t0 = time.monotonic()
+
+        graph_dir.mkdir(parents=True, exist_ok=True)
+        graph_files = [(fp, fs.path) for fp, fs in extracted]
+        n_graph = build_graph(graph_files, graph_dir)
+
+        # Count edges for display
+        call_graph = CallGraph.load(graph_dir)
+        n_edges = sum(len(v) for v in call_graph._callers.values())
+
+        dt = time.monotonic() - t0
+        click.echo("\r" + _step_line(step, n_steps, "Graph", "done",
+                                      f"{n_graph} files, {n_edges} edges ({dt:.1f}s)"))
+
+    # ---- Step 3: Describe ----
+    step = 3
+    desc_dir = ck_dir / "descriptions"
+    desc_dir.mkdir(parents=True, exist_ok=True)
+    if "describe" in skip:
+        click.echo(_step_line(step, n_steps, "Describe", "skip", "skipped"))
+    else:
+        click.echo(_step_line(step, n_steps, "Describe", "running"), nl=False)
+        t0 = time.monotonic()
+
+        # Load architecture context
+        arch_dir = ck_dir / "articles"
+        architecture_context: str | None = None
+        arch_file = arch_dir / "architecture-overview.md"
+        if arch_file.is_file():
+            raw = arch_file.read_text()
+            if raw.startswith("---"):
+                end = raw.find("---", 3)
+                if end != -1:
+                    architecture_context = raw[end + 3:].strip()
+
+        # Load call graph
+        if not ("graph" in skip) and graph_dir.is_dir():
+            if "call_graph" not in dir():
+                call_graph = CallGraph.load(graph_dir)
+        elif graph_dir.is_dir():
+            call_graph = CallGraph.load(graph_dir)
+        else:
+            call_graph = None
+
+        # Group files by directory for neighbor context
+        dir_groups: dict[Path, list[tuple[Path, FileStructure]]] = {}
+        for file_path, fs in extracted:
+            dir_groups.setdefault(file_path.parent, []).append((file_path, fs))
+
+        desc_generated = 0
+        desc_cached = 0
+
+        for file_path, fs in extracted:
+            rel = fs.path
+            out_path = desc_dir / (rel + ".md")
+            current_hash = _file_hash(file_path)
+
+            # Skip if unchanged
+            if not force and out_path.exists():
+                existing = out_path.read_text()
+                if existing.startswith("---"):
+                    fm_section = existing.split("---")[1] if "---" in existing[3:] else ""
+                    if f"source_hash: {current_hash}" in fm_section:
+                        desc_cached += 1
+                        continue
+
+            source = file_path.read_text()
+
+            # Neighbor context
+            siblings = dir_groups.get(file_path.parent, [])
+            neighbor_ctx: dict[str, str] = {}
+            neighbor_chars = 0
+            for sib_path, sib_fs in siblings:
+                if sib_path == file_path:
+                    continue
+                sib_source = sib_path.read_text()
+                if neighbor_chars + len(sib_source) > 50_000:
+                    continue
+                neighbor_ctx[sib_fs.path] = sib_source
+                neighbor_chars += len(sib_source)
+
+            file_callers = None
+            if call_graph:
+                file_callers = call_graph.get_file_callers(rel) or None
+
+            prompt = build_prompt(
+                structure=fs,
+                source=source,
+                neighbor_context=neighbor_ctx if neighbor_ctx else None,
+                architecture_context=architecture_context,
+                project_name=proj,
+                callers=file_callers,
+            )
+
+            n_elements = count_elements(fs)
+            tokens = min(max(n_elements * 100, 4096), 16384)
+            response_text = describe_file(prompt, model_tier=model_tier, max_tokens=tokens)
+            desc = parse_response(response_text, fs)
+
+            # Continuation for missing elements
+            for _ in range(2):
+                missing = find_missing_elements(fs, desc)
+                if not missing:
+                    break
+                cont_prompt = build_continuation_prompt(
+                    structure=fs, source=source,
+                    missing=missing, project_name=proj,
+                )
+                cont_tokens = min(max(len(missing) * 100, 4096), 16384)
+                cont_text = describe_file(cont_prompt, model_tier=model_tier, max_tokens=cont_tokens)
+                cont_desc = parse_response(cont_text, fs)
+                desc.symbols.extend(cont_desc.symbols)
+
+            md = render_description_markdown(desc, source_hash=current_hash, model=model_tier)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(md)
+            desc_generated += 1
+
+        dt = time.monotonic() - t0
+        parts = [f"{len(extracted)} files"]
+        if desc_cached:
+            parts.append(f"{desc_cached} cached")
+        if desc_generated:
+            parts.append(f"{desc_generated} generated")
+        click.echo("\r" + _step_line(step, n_steps, "Describe", "done",
+                                      f"{', '.join(parts)} ({dt:.1f}s)"))
+
+    # ---- Step 4: Synthesize ----
+    step = 4
+    articles_dir = ck_dir / "articles"
+    articles_dir.mkdir(parents=True, exist_ok=True)
+    if "synthesize" in skip:
+        click.echo(_step_line(step, n_steps, "Synthesize", "skip", "skipped"))
+    else:
+        click.echo(_step_line(step, n_steps, "Synthesize", "running"), nl=False)
+        t0 = time.monotonic()
+
+        source_hashes: dict[str, str] = {}
+        for file_path, fs in extracted:
+            source_hashes[fs.path] = _file_hash(file_path)
+
+        source_paths = [fs.path for _, fs in files]
+        synth_generated = 0
+        synth_cached = 0
+
+        def _synth_should_regen(article_path: Path, diff_paths: list[str] | None = None) -> bool:
+            nonlocal synth_cached
+            if force or not git_available or not head_commit:
+                return True
+            if not article_path.exists():
+                return True
+            existing = article_path.read_text()
+            fm = parse_article_frontmatter(existing)
+            stored_commit = fm.get("commit")
+            if not stored_commit:
+                return True
+            if fm.get("commit_dirty") == "true":
+                return True
+            diff = get_diff(root, stored_commit, paths=diff_paths)
+            if diff is None:
+                return True
+            if not diff.strip():
+                synth_cached += 1
+                return False
+            title = fm.get("title", article_path.stem)
+            content_start = existing.find("---", 3)
+            content = existing[content_start + 3:].strip() if content_start >= 0 else existing
+            eval_prompt = build_significance_prompt(title, content, diff)
+            verdict_response = describe_file(eval_prompt, model_tier="haiku", max_tokens=256)
+            significant = parse_significance_verdict(verdict_response)
+            if not significant:
+                synth_cached += 1
+            return significant
+
+        batched = needs_batching(files)
+
+        if batched:
+            skeleton = build_full_skeleton(files)
+            groups = group_by_directory(files)
+            module_summaries: dict[str, str] = {}
+            summaries_dir = articles_dir / "module-summaries"
+            summaries_dir.mkdir(parents=True, exist_ok=True)
+            any_summary_regenerated = False
+
+            for dir_path, module_files in sorted(groups.items()):
+                safe_name = dir_path.replace("/", "_").replace("\\", "_") or "_root"
+                summary_path = summaries_dir / f"{safe_name}.md"
+                module_source_paths = [fs.path for fs, _ in module_files]
+
+                if not _synth_should_regen(summary_path, diff_paths=module_source_paths):
+                    existing = summary_path.read_text()
+                    content_start = existing.find("---", 3)
+                    if content_start >= 0:
+                        body = existing[content_start + 3:].strip()
+                        heading_end = body.find("\n")
+                        if heading_end >= 0 and body.startswith("# "):
+                            body = body[heading_end:].strip()
+                        module_summaries[dir_path] = body
+                    else:
+                        module_summaries[dir_path] = existing
+                    continue
+
+                any_summary_regenerated = True
+                batches = split_module_batches(module_files)
+
+                if len(batches) == 1:
+                    prompt = build_module_summary_prompt(
+                        module_path=dir_path,
+                        module_files=module_files,
+                        project_skeleton=skeleton,
+                        project_name=proj,
+                    )
+                    summary = describe_file(prompt, model_tier=model_tier, max_tokens=4096)
+                else:
+                    partial_summaries: list[str] = []
+                    for batch in batches:
+                        prompt = build_module_summary_prompt(
+                            module_path=dir_path,
+                            module_files=batch,
+                            project_skeleton=skeleton,
+                            project_name=proj,
+                        )
+                        partial_summaries.append(
+                            describe_file(prompt, model_tier=model_tier, max_tokens=4096)
+                        )
+                    merge_prompt = build_merge_summaries_prompt(
+                        module_path=dir_path,
+                        partial_summaries=partial_summaries,
+                        project_name=proj,
+                    )
+                    summary = describe_file(merge_prompt, model_tier=model_tier, max_tokens=4096)
+
+                module_summaries[dir_path] = summary
+                synth_generated += 1
+                article = render_article(
+                    title=f"Module: {dir_path}", content=summary,
+                    article_type="module-summary",
+                    sources={fs.path: source_hashes[fs.path] for fs, _ in module_files},
+                    model=model_tier, commit=record_commit, commit_dirty=dirty,
+                )
+                summary_path.write_text(article)
+
+            # Architecture
+            arch_path = articles_dir / "architecture-overview.md"
+            arch_regenerated = False
+            if not any_summary_regenerated and not _synth_should_regen(arch_path, diff_paths=source_paths):
+                existing = arch_path.read_text()
+                content_start = existing.find("---", 3)
+                if content_start >= 0:
+                    body = existing[content_start + 3:].strip()
+                    heading_end = body.find("\n")
+                    if heading_end >= 0 and body.startswith("# "):
+                        body = body[heading_end:].strip()
+                    architecture = body
+                else:
+                    architecture = existing
+            else:
+                arch_prompt = build_architecture_from_summaries_prompt(
+                    project_skeleton=skeleton,
+                    module_summaries=module_summaries,
+                    project_name=proj,
+                )
+                architecture = describe_file(arch_prompt, model_tier=model_tier, max_tokens=8192)
+                arch_regenerated = True
+                synth_generated += 1
+                article = render_article(
+                    title="Architecture Overview", content=architecture,
+                    article_type="architecture", sources=source_hashes,
+                    model=model_tier, commit=record_commit, commit_dirty=dirty,
+                )
+                arch_path.write_text(article)
+        else:
+            # Single-pass
+            arch_path = articles_dir / "architecture-overview.md"
+            arch_regenerated = False
+            if not _synth_should_regen(arch_path, diff_paths=source_paths):
+                existing = arch_path.read_text()
+                content_start = existing.find("---", 3)
+                if content_start >= 0:
+                    body = existing[content_start + 3:].strip()
+                    heading_end = body.find("\n")
+                    if heading_end >= 0 and body.startswith("# "):
+                        body = body[heading_end:].strip()
+                    architecture = body
+                else:
+                    architecture = existing
+            else:
+                arch_prompt = build_architecture_prompt(files=files, project_name=proj)
+                architecture = describe_file(arch_prompt, model_tier=model_tier, max_tokens=8192)
+                arch_regenerated = True
+                synth_generated += 1
+                article = render_article(
+                    title="Architecture Overview", content=architecture,
+                    article_type="architecture", sources=source_hashes,
+                    model=model_tier, commit=record_commit, commit_dirty=dirty,
+                )
+                arch_path.write_text(article)
+
+        # Flows
+        if not skip_flows:
+            flow_id_prompt = build_flow_identification_prompt(
+                architecture=architecture, project_name=proj,
+            )
+            flow_response = describe_file(flow_id_prompt, model_tier=model_tier, max_tokens=2048)
+            flow_list = parse_flows(flow_response)
+
+            for name, description in flow_list:
+                safe_flow_name = name.lower().replace(" ", "-")
+                flow_path = articles_dir / f"flow-{safe_flow_name}.md"
+
+                if not _synth_should_regen(flow_path, diff_paths=source_paths):
+                    continue
+
+                if batched:
+                    prompt = build_flow_prompt_from_skeleton(
+                        flow_name=name, flow_description=description,
+                        project_skeleton=skeleton, module_summaries=module_summaries,
+                        architecture=architecture, project_name=proj,
+                    )
+                else:
+                    prompt = build_flow_prompt(
+                        flow_name=name, flow_description=description,
+                        files=files, architecture=architecture, project_name=proj,
+                    )
+
+                response = describe_file(prompt, model_tier=model_tier, max_tokens=8192)
+                synth_generated += 1
+                article = render_article(
+                    title=f"Flow: {name}", content=response,
+                    article_type="flow", sources=source_hashes,
+                    model=model_tier, commit=record_commit, commit_dirty=dirty,
+                )
+                flow_path.write_text(article)
+
+        dt = time.monotonic() - t0
+        parts = []
+        if synth_generated:
+            parts.append(f"{synth_generated} generated")
+        if synth_cached:
+            parts.append(f"{synth_cached} cached")
+        if not parts:
+            parts.append("up to date")
+        click.echo("\r" + _step_line(step, n_steps, "Synthesize", "done",
+                                      f"{', '.join(parts)} ({dt:.1f}s)"))
+
+    # ---- Step 5: Index ----
+    step = 5
+    if "index" in skip:
+        click.echo(_step_line(step, n_steps, "Index", "skip", "skipped"))
+    else:
+        click.echo(_step_line(step, n_steps, "Index", "running"), nl=False)
+        t0 = time.monotonic()
+
+        emb_cfg = cfg.embedding if cfg else EmbeddingConfig()
+        a_dir = ck_dir / "articles" if (ck_dir / "articles").is_dir() else None
+        d_dir = ck_dir / "descriptions" if (ck_dir / "descriptions").is_dir() else None
+        db = ck_dir / "codeknowledge.db"
+
+        result_path = build_index(
+            articles_dir=a_dir,
+            descriptions_dir=d_dir,
+            db_path=db,
+            embedding_config=emb_cfg,
+        )
+
+        conn = sqlite3.connect(str(result_path))
+        n_chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        dim_row = conn.execute("SELECT value FROM meta WHERE key='embedding_dim'").fetchone()
+        conn.close()
+        dim = dim_row[0] if dim_row else "?"
+
+        dt = time.monotonic() - t0
+        click.echo("\r" + _step_line(step, n_steps, "Index", "done",
+                                      f"{n_chunks} chunks · {dim}d ({dt:.1f}s)"))
+
+    # ---- Summary ----
+    total_time = time.monotonic() - t_start
+    minutes = int(total_time // 60)
+    seconds = total_time % 60
+    if minutes:
+        click.echo(f"\nDone in {minutes}m {seconds:.0f}s")
+    else:
+        click.echo(f"\nDone in {seconds:.1f}s")
+
+
 if __name__ == "__main__":
     cli()
