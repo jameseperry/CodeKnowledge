@@ -17,13 +17,16 @@ from pathlib import Path
 import numpy as np
 import yaml
 
+from .config import EmbeddingConfig
+from .embeddings import get_embedder
+
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-DEFAULT_MODEL = "all-MiniLM-L6-v2"
+DEFAULT_MODEL = "nomic-ai/nomic-embed-text-v1.5"
 # Target chunk size in chars.  Headings act as natural split points; chunks
 # larger than this get split further by paragraph.
 CHUNK_TARGET = 1500
@@ -228,27 +231,8 @@ def _split_by_paragraph(text: str, target: int) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Embedding
+# Serialization
 # ---------------------------------------------------------------------------
-
-_embedder = None
-
-
-def get_embedder(model_name: str = DEFAULT_MODEL):
-    """Lazy-load the sentence-transformer model."""
-    global _embedder
-    if _embedder is None or _embedder.model_name != model_name:
-        from sentence_transformers import SentenceTransformer
-        log.info("Loading embedding model: %s", model_name)
-        _embedder = SentenceTransformer(model_name)
-        _embedder.model_name = model_name
-    return _embedder
-
-
-def embed_texts(texts: list[str], model_name: str = DEFAULT_MODEL) -> np.ndarray:
-    """Embed a list of texts, returning an (N, dim) float32 array."""
-    model = get_embedder(model_name)
-    return model.encode(texts, show_progress_bar=False, convert_to_numpy=True)
 
 
 def _serialize_embedding(vec: np.ndarray) -> bytes:
@@ -296,16 +280,15 @@ def build_index(
     articles_dir: Path | None = None,
     descriptions_dir: Path | None = None,
     db_path: Path | None = None,
-    model_name: str = DEFAULT_MODEL,
+    embedding_config: EmbeddingConfig | None = None,
 ) -> Path:
     """Build (or rebuild) the embedding index from markdown files.
 
     Args:
         articles_dir: Directory containing article markdown files.
         descriptions_dir: Directory containing description markdown files.
-        db_path: Path for the SQLite database.  Defaults to
-            articles_dir/../codeknowledge.db or ./codeknowledge.db.
-        model_name: Sentence-transformer model name.
+        db_path: Path for the SQLite database.
+        embedding_config: Embedding configuration. Uses defaults if not provided.
 
     Returns:
         Path to the created database.
@@ -327,6 +310,9 @@ def build_index(
         db_path.unlink()
 
     conn = _init_db(db_path)
+
+    embedder = get_embedder(embedding_config)
+    model_name = embedding_config.model_name if embedding_config else DEFAULT_MODEL
 
     # Store metadata
     conn.execute(
@@ -370,7 +356,7 @@ def build_index(
     # Embed all chunks in one batch
     embed_texts_list = [chunk["embed_text"] for _, chunk in all_chunks]
     log.info("Embedding %d chunks...", len(embed_texts_list))
-    embeddings = embed_texts(embed_texts_list, model_name=model_name)
+    embeddings = embedder.embed_documents(embed_texts_list)
 
     # Store embeddings
     for i, (_, chunk) in enumerate(all_chunks):
@@ -401,7 +387,7 @@ def search_index(
     query: str,
     db_path: Path,
     top_k: int = 10,
-    model_name: str | None = None,
+    embedding_config: EmbeddingConfig | None = None,
 ) -> list[dict]:
     """Search the embedding index for chunks matching a query.
 
@@ -409,33 +395,22 @@ def search_index(
         query: Natural language search query.
         db_path: Path to the SQLite index database.
         top_k: Number of results to return.
-        model_name: Override the embedding model (default: use whatever
-            the index was built with).
+        embedding_config: Embedding configuration. Uses defaults if not provided.
 
     Returns:
-        List of result dicts, each with:
-            score: float (cosine similarity)
-            document: str (document path)
-            doc_type: str
-            title: str
-            heading: str
-            content: str
+        List of result dicts with score, document, doc_type, title,
+        heading, and content.
     """
     if not db_path.exists():
         raise FileNotFoundError(f"Index not found: {db_path}")
 
     conn = sqlite3.connect(str(db_path))
 
-    # Use the model the index was built with, unless overridden
-    if model_name is None:
-        row = conn.execute(
-            "SELECT value FROM meta WHERE key = 'embedding_model'"
-        ).fetchone()
-        model_name = row[0] if row else DEFAULT_MODEL
+    embedder = get_embedder(embedding_config)
 
     # Embed the query
-    query_vec = embed_texts([query], model_name=model_name)[0]
-    query_norm = query_vec / np.linalg.norm(query_vec)
+    query_vec = embedder.embed_query(query)
+    query_norm = query_vec / (np.linalg.norm(query_vec) or 1.0)
 
     # Load all embeddings
     rows = conn.execute(

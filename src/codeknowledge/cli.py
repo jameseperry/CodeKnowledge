@@ -719,7 +719,7 @@ def graph(
 @click.option("--db", "db_path", type=click.Path(), default=None,
               help="Output database path. Defaults to codeknowledge.db next to articles.")
 @click.option("--model", "embed_model", default=None,
-              help="Sentence-transformer model name. Default: all-MiniLM-L6-v2.")
+              help="Embedding model name. Default: nomic-ai/nomic-embed-text-v1.5.")
 @click.option("--repo-root", type=click.Path(exists=True), default=None,
               help="Repository root (looks for .codeknowledge/ layout).")
 @click.pass_context
@@ -737,7 +737,7 @@ def index(
     automatically finds articles/ and descriptions/ directories.
     Otherwise, specify --articles-dir and/or --descriptions-dir explicitly.
     """
-    from .index import build_index, DEFAULT_MODEL
+    from .index import build_index
 
     # Resolve directories
     a_dir: Path | None = Path(articles_dir).resolve() if articles_dir else None
@@ -745,8 +745,10 @@ def index(
     db: Path | None = Path(db_path).resolve() if db_path else None
 
     # Auto-detect from repo root
+    cfg = None
     if a_dir is None and d_dir is None:
         root = _resolve_root(repo_root, Path.cwd())
+        cfg = _load_config(root)
         ck = root / ".codeknowledge"
         if ck.is_dir():
             a_candidate = ck / "articles"
@@ -766,19 +768,33 @@ def index(
         )
         sys.exit(1)
 
-    model = embed_model or DEFAULT_MODEL
+    # Build embedding config: CLI --model overrides config.yaml
+    from .config import EmbeddingConfig
+    if cfg:
+        emb_cfg = cfg.embedding
+    else:
+        emb_cfg = EmbeddingConfig()
+    if embed_model:
+        emb_cfg = EmbeddingConfig(
+            backend=emb_cfg.backend,
+            model_name=embed_model,
+            dimensions=emb_cfg.dimensions,
+            api_url=emb_cfg.api_url,
+            batch_size=emb_cfg.batch_size,
+            max_concurrent=emb_cfg.max_concurrent,
+        )
 
     # Count documents
     n_articles = len(list(a_dir.rglob("*.md"))) if a_dir else 0
     n_descs = len(list(d_dir.rglob("*.md"))) if d_dir else 0
     click.echo(f"Indexing: {n_articles} articles, {n_descs} descriptions")
-    click.echo(f"Embedding model: {model}")
+    click.echo(f"Embedding model: {emb_cfg.model_name} ({emb_cfg.backend})")
 
     result_path = build_index(
         articles_dir=a_dir,
         descriptions_dir=d_dir,
         db_path=db,
-        model_name=model,
+        embedding_config=emb_cfg,
     )
 
     click.echo(f"\nIndex built: {result_path}")
@@ -820,9 +836,11 @@ def search(
 
     # Resolve DB path
     db: Path | None = Path(db_path).resolve() if db_path else None
+    cfg = None
 
     if db is None:
         root = _resolve_root(repo_root, Path.cwd())
+        cfg = _load_config(root)
         candidate = root / ".codeknowledge" / "codeknowledge.db"
         if candidate.exists():
             db = candidate
@@ -835,7 +853,8 @@ def search(
         )
         sys.exit(1)
 
-    results = search_index(query=query, db_path=db, top_k=top_k)
+    emb_cfg = cfg.embedding if cfg else None
+    results = search_index(query=query, db_path=db, top_k=top_k, embedding_config=emb_cfg)
 
     if not results:
         click.echo("No results found.")

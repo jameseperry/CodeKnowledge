@@ -21,6 +21,18 @@ DEFAULT_EXCLUDE = [
 
 
 @dataclass
+class EmbeddingConfig:
+    """Embedding model configuration."""
+
+    backend: str = "local"  # "local" or "remote"
+    model_name: str = "nomic-ai/nomic-embed-text-v1.5"
+    dimensions: int = 768
+    api_url: str = ""  # only needed for remote
+    batch_size: int = 128
+    max_concurrent: int = 4
+
+
+@dataclass
 class Config:
     """Project-level configuration stored in .codeknowledge/config.yaml."""
 
@@ -28,6 +40,7 @@ class Config:
     source_dirs: list[str] = field(default_factory=list)
     exclude: list[str] = field(default_factory=lambda: list(DEFAULT_EXCLUDE))
     model: str = "sonnet"
+    embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
 
     # Paths resolved at load time (not serialized)
     repo_root: Path = field(default_factory=lambda: Path("."), repr=False)
@@ -47,11 +60,21 @@ class Config:
         else:
             raw = {}
 
+        emb_raw = raw.get("embedding", {})
+
         return cls(
             project_name=raw.get("project_name", repo_root.name),
             source_dirs=raw.get("source_dirs", []),
             exclude=raw.get("exclude", list(DEFAULT_EXCLUDE)),
             model=raw.get("model", "sonnet"),
+            embedding=EmbeddingConfig(
+                backend=emb_raw.get("backend", "local"),
+                model_name=emb_raw.get("model_name", "nomic-ai/nomic-embed-text-v1.5"),
+                dimensions=emb_raw.get("dimensions", 768),
+                api_url=emb_raw.get("api_url", ""),
+                batch_size=emb_raw.get("batch_size", 128),
+                max_concurrent=emb_raw.get("max_concurrent", 4),
+            ),
             repo_root=repo_root,
             ck_dir=ck_dir,
         )
@@ -68,6 +91,25 @@ class Config:
             data["source_dirs"] = self.source_dirs
         data["exclude"] = self.exclude
         data["model"] = self.model
+
+        # Only serialize embedding if non-default
+        emb = self.embedding
+        default_emb = EmbeddingConfig()
+        emb_data: dict = {}
+        if emb.backend != default_emb.backend:
+            emb_data["backend"] = emb.backend
+        if emb.model_name != default_emb.model_name:
+            emb_data["model_name"] = emb.model_name
+        if emb.dimensions != default_emb.dimensions:
+            emb_data["dimensions"] = emb.dimensions
+        if emb.api_url:
+            emb_data["api_url"] = emb.api_url
+        if emb.batch_size != default_emb.batch_size:
+            emb_data["batch_size"] = emb.batch_size
+        if emb.max_concurrent != default_emb.max_concurrent:
+            emb_data["max_concurrent"] = emb.max_concurrent
+        if emb_data:
+            data["embedding"] = emb_data
 
         config_path.write_text(yaml.dump(data, default_flow_style=False, sort_keys=False))
         return config_path
