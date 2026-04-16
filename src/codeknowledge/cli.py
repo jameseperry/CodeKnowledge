@@ -195,6 +195,7 @@ def _print_elements(elements, indent: int, show_body: bool) -> None:
                    "Defaults to .codeknowledge/articles/ under repo root.")
 @click.option("--model", default=None, help="Model tier: haiku, sonnet, opus, or a model name.")
 @click.option("--dry-run", is_flag=True, help="Print the prompt without calling the LLM.")
+@click.option("--force", is_flag=True, help="Regenerate descriptions even if source is unchanged.")
 @click.option("--file-filter", default=None, help="Only process files matching this substring.")
 @click.pass_context
 def describe(
@@ -205,6 +206,7 @@ def describe(
     articles_dir: str | None,
     model: str | None,
     dry_run: bool,
+    force: bool,
     file_filter: str | None,
 ) -> None:
     """Generate LLM descriptions for source files.
@@ -213,7 +215,7 @@ def describe(
     sibling-file context and architecture context, and writes description
     markdown files.
     """
-    from .describe import build_prompt, parse_response, render_description_markdown
+    from .describe import build_prompt, parse_response, render_description_markdown, count_elements, find_missing_elements, build_continuation_prompt
     from .graph import CallGraph
     from .llm import describe_file
 
@@ -280,8 +282,19 @@ def describe(
 
     click.echo(f"Found {len(files)} files to describe.")
 
+    skipped = 0
     for i, (file_path, fs) in enumerate(files):
         rel = fs.path
+        out_path = out / (rel + ".md")
+
+        # Skip if source hasn't changed since last description
+        current_hash = _file_hash(file_path)
+        if not force and out_path.exists():
+            existing = out_path.read_text()
+            if f"source_hash: {current_hash}" in existing.split("---")[1] if existing.startswith("---") else "":
+                skipped += 1
+                continue
+
         click.echo(f"\n[{i+1}/{len(files)}] {rel}")
 
         source = file_path.read_text()
@@ -320,15 +333,35 @@ def describe(
             click.echo("--- End prompt ---")
             continue
 
-        response_text = describe_file(prompt, model_tier=model_tier)
+        # Scale max_tokens to the number of elements (~100 tokens per element)
+        n_elements = count_elements(fs)
+        tokens = min(max(n_elements * 100, 4096), 16384)
+
+        response_text = describe_file(prompt, model_tier=model_tier, max_tokens=tokens)
         desc = parse_response(response_text, fs)
+
+        # Follow-up for missing elements (up to 2 continuation rounds)
+        for round_num in range(2):
+            missing = find_missing_elements(fs, desc)
+            if not missing:
+                break
+            click.echo(f"     {len(missing)} elements missing, continuation {round_num + 1}...")
+            cont_prompt = build_continuation_prompt(
+                structure=fs,
+                source=source,
+                missing=missing,
+                project_name=cfg.project_name if cfg else root.name,
+            )
+            cont_tokens = min(max(len(missing) * 100, 4096), 16384)
+            cont_text = describe_file(cont_prompt, model_tier=model_tier, max_tokens=cont_tokens)
+            cont_desc = parse_response(cont_text, fs)
+            desc.symbols.extend(cont_desc.symbols)
         md = render_description_markdown(
             desc,
-            source_hash=_file_hash(file_path),
+            source_hash=current_hash,
             model=model_tier,
         )
 
-        out_path = out / (rel + ".md")
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(md)
         try:
@@ -337,6 +370,9 @@ def describe(
             display_path = out_path
         click.echo(f"  -> {display_path}")
         click.echo(f"     {len(desc.symbols)} symbols described")
+
+    if skipped:
+        click.echo(f"\nSkipped {skipped} unchanged files (use --force to regenerate).")
 
 
 # ---------------------------------------------------------------------------
@@ -363,6 +399,11 @@ def init(ctx: click.Context, path: str, project_name: str | None, source_dirs: t
     ck_dir.mkdir()
     (ck_dir / "descriptions").mkdir()
     (ck_dir / "articles").mkdir()
+
+    # Create .gitignore inside .codeknowledge to exclude the binary index
+    ck_gitignore = ck_dir / ".gitignore"
+    ck_gitignore.write_text("# Binary embedding index (regenerate with 'codeknowledge index')\ncodeknowledge.db\n")
+    click.echo("Created .codeknowledge/.gitignore (excludes codeknowledge.db)")
 
     # Create default config
     cfg = Config(
@@ -404,6 +445,7 @@ def init(ctx: click.Context, path: str, project_name: str | None, source_dirs: t
 @click.option("--project-name", default=None, help="Project name for context.")
 @click.option("--dry-run", is_flag=True, help="Print prompts without calling the LLM.")
 @click.option("--skip-flows", is_flag=True, help="Skip flow document generation.")
+@click.option("--force", is_flag=True, help="Regenerate all articles, ignoring commit cache.")
 @click.pass_context
 def synthesize(
     ctx: click.Context,
@@ -414,6 +456,7 @@ def synthesize(
     project_name: str | None,
     dry_run: bool,
     skip_flows: bool,
+    force: bool,
 ) -> None:
     """Synthesize architecture articles from source code.
 
@@ -433,13 +476,17 @@ def synthesize(
         build_full_skeleton,
         build_merge_summaries_prompt,
         build_module_summary_prompt,
+        build_significance_prompt,
         group_by_directory,
         needs_batching,
+        parse_article_frontmatter,
         parse_flows,
+        parse_significance_verdict,
         render_article,
         split_module_batches,
     )
     from .llm import describe_file
+    from .git import get_head_commit, has_uncommitted_changes, get_diff, is_git_repo
 
     target = Path(path).resolve() if path else Path.cwd().resolve()
     root = _resolve_root(repo_root, target)
@@ -478,6 +525,66 @@ def synthesize(
 
     click.echo(f"Collected {len(files)} source files.")
 
+    # ---- Git commit tracking ----
+    git_available = is_git_repo(root)
+    head_commit: str | None = None
+    dirty = False
+    source_paths = [fs.path for fs, _ in files]
+
+    if git_available:
+        head_commit = get_head_commit(root)
+        dirty = has_uncommitted_changes(root, source_paths)
+        if head_commit:
+            click.echo(f"Git commit: {head_commit}" + (" (dirty)" if dirty else ""))
+        if dirty:
+            click.echo("Warning: uncommitted changes detected — commit info will not be recorded.")
+    else:
+        click.echo("Not a git repository — commit tracking disabled.")
+
+    # Commit to record: only if clean
+    record_commit = head_commit if (head_commit and not dirty) else None
+    skipped_articles = 0
+
+    def _should_regenerate(article_path: Path, diff_paths: list[str] | None = None) -> bool:
+        """Check if an existing article should be regenerated based on git diff."""
+        nonlocal skipped_articles
+        if force or not git_available or not head_commit:
+            return True
+        if not article_path.exists():
+            return True
+        existing = article_path.read_text()
+        fm = parse_article_frontmatter(existing)
+        stored_commit = fm.get("commit")
+        if not stored_commit:
+            return True
+        if fm.get("commit_dirty") == "true":
+            return True
+        # Get diff since the stored commit
+        diff = get_diff(root, stored_commit, paths=diff_paths)
+        if diff is None:
+            return True  # git error — regenerate to be safe
+        if not diff.strip():
+            skipped_articles += 1
+            return False  # no changes
+        # Ask the LLM if the diff is significant
+        title = fm.get("title", article_path.stem)
+        # Extract content after frontmatter
+        content_start = existing.find("---", 3)
+        if content_start >= 0:
+            content = existing[content_start + 3:].strip()
+        else:
+            content = existing
+        eval_prompt = build_significance_prompt(title, content, diff)
+        click.echo(f"    Evaluating significance ({len(diff):,} chars of diff)...")
+        verdict_response = describe_file(eval_prompt, model_tier="haiku", max_tokens=256)
+        significant = parse_significance_verdict(verdict_response)
+        if not significant:
+            skipped_articles += 1
+            click.echo(f"    Diff not significant — skipping.")
+        else:
+            click.echo(f"    Diff is significant — regenerating.")
+        return significant
+
     batched = needs_batching(files)
     if batched:
         click.echo(f"Large project detected — using batched synthesis.\n")
@@ -495,11 +602,32 @@ def synthesize(
         module_summaries: dict[str, str] = {}
         summaries_dir = out / "module-summaries"
         summaries_dir.mkdir(parents=True, exist_ok=True)
+        any_summary_regenerated = False
 
         for i, (dir_path, module_files) in enumerate(sorted(groups.items()), 1):
             n_files = len(module_files)
             n_chars = sum(len(s) for _, s in module_files)
             click.echo(f"  [{i}/{len(groups)}] {dir_path} ({n_files} files, {n_chars:,} chars)")
+
+            # Incremental check for module summary
+            safe_name = dir_path.replace("/", "_").replace("\\", "_") or "_root"
+            summary_path = summaries_dir / f"{safe_name}.md"
+            module_source_paths = [fs.path for fs, _ in module_files]
+
+            if not _should_regenerate(summary_path, diff_paths=module_source_paths):
+                click.echo(f"    Unchanged — reusing cached summary.")
+                existing = summary_path.read_text()
+                content_start = existing.find("---", 3)
+                if content_start >= 0:
+                    # Skip frontmatter and "# Module: ..." heading
+                    body = existing[content_start + 3:].strip()
+                    heading_end = body.find("\n")
+                    if heading_end >= 0 and body.startswith("# "):
+                        body = body[heading_end:].strip()
+                    module_summaries[dir_path] = body
+                else:
+                    module_summaries[dir_path] = existing
+                continue
 
             batches = split_module_batches(module_files)
 
@@ -554,6 +682,7 @@ def synthesize(
                 summary = describe_file(merge_prompt, model_tier=model_tier, max_tokens=4096)
 
             module_summaries[dir_path] = summary
+            any_summary_regenerated = True
 
             # Save module summary
             safe_name = dir_path.replace("/", "_").replace("\\", "_") or "_root"
@@ -564,6 +693,8 @@ def synthesize(
                 article_type="module-summary",
                 sources={fs.path: source_hashes[fs.path] for fs, _ in module_files},
                 model=model_tier,
+                commit=record_commit,
+                commit_dirty=dirty,
             )
             summary_path.write_text(article)
             click.echo(f"    -> {summary_path.relative_to(out)}")
@@ -572,38 +703,90 @@ def synthesize(
             return
 
         click.echo(f"\n--- Architecture overview (from {len(module_summaries)} module summaries) ---")
-        arch_prompt = build_architecture_from_summaries_prompt(
-            project_skeleton=skeleton,
-            module_summaries=module_summaries,
-            project_name=proj,
-        )
+
+        # In batched mode, skip architecture if no summaries were regenerated
+        arch_path = out / "architecture-overview.md"
+        if not any_summary_regenerated and arch_path.exists() and not force:
+            click.echo("  No module summaries changed — checking architecture...")
+            if not _should_regenerate(arch_path, diff_paths=source_paths):
+                click.echo("  Architecture unchanged — skipping.")
+                # Load existing architecture for flow generation
+                existing = arch_path.read_text()
+                content_start = existing.find("---", 3)
+                if content_start >= 0:
+                    body = existing[content_start + 3:].strip()
+                    heading_end = body.find("\n")
+                    if heading_end >= 0 and body.startswith("# "):
+                        body = body[heading_end:].strip()
+                    architecture = body
+                else:
+                    architecture = existing
+                arch_regenerated = False
+            else:
+                arch_prompt = build_architecture_from_summaries_prompt(
+                    project_skeleton=skeleton,
+                    module_summaries=module_summaries,
+                    project_name=proj,
+                )
+                arch_regenerated = True
+        else:
+            arch_prompt = build_architecture_from_summaries_prompt(
+                project_skeleton=skeleton,
+                module_summaries=module_summaries,
+                project_name=proj,
+            )
+            arch_regenerated = True
     else:
         # --- Single-pass mode ---
         click.echo("\n--- Architecture overview ---")
-        arch_prompt = build_architecture_prompt(files=files, project_name=proj)
+        arch_path = out / "architecture-overview.md"
+        if not _should_regenerate(arch_path, diff_paths=source_paths):
+            click.echo("  Architecture unchanged — skipping.")
+            existing = arch_path.read_text()
+            content_start = existing.find("---", 3)
+            if content_start >= 0:
+                body = existing[content_start + 3:].strip()
+                heading_end = body.find("\n")
+                if heading_end >= 0 and body.startswith("# "):
+                    body = body[heading_end:].strip()
+                architecture = body
+            else:
+                architecture = existing
+            arch_regenerated = False
+        else:
+            arch_prompt = build_architecture_prompt(files=files, project_name=proj)
+            arch_regenerated = True
 
     if dry_run:
-        click.echo(f"  Prompt: {len(arch_prompt)} chars")
-        click.echo(arch_prompt[:2000])
-        click.echo("...")
+        if arch_regenerated:
+            click.echo(f"  Prompt: {len(arch_prompt)} chars")
+            click.echo(arch_prompt[:2000])
+            click.echo("...")
         return
 
-    architecture = describe_file(arch_prompt, model_tier=model_tier, max_tokens=8192)
+    if arch_regenerated:
+        architecture = describe_file(arch_prompt, model_tier=model_tier, max_tokens=8192)
 
-    article_path = out / "architecture-overview.md"
-    article = render_article(
-        title="Architecture Overview",
-        content=architecture,
-        article_type="architecture",
-        sources=source_hashes,
-        model=model_tier,
-    )
-    article_path.write_text(article)
-    click.echo(f"  -> {article_path.name}")
+        article_path = out / "architecture-overview.md"
+        article = render_article(
+            title="Architecture Overview",
+            content=architecture,
+            article_type="architecture",
+            sources=source_hashes,
+            model=model_tier,
+            commit=record_commit,
+            commit_dirty=dirty,
+        )
+        article_path.write_text(article)
+        click.echo(f"  -> {article_path.name}")
 
     # ---- Step 2: Key flow documents ----
     if not skip_flows:
-        click.echo("\n--- Identifying key flows ---")
+        # If architecture wasn't regenerated, flows are likely still valid
+        if not arch_regenerated:
+            click.echo("\n--- Checking flow documents ---")
+        else:
+            click.echo("\n--- Identifying key flows ---")
 
         flow_id_prompt = build_flow_identification_prompt(
             architecture=architecture,
@@ -617,7 +800,13 @@ def synthesize(
             click.echo(f"    - {name}: {desc}")
 
         for name, description in flows:
+            safe_flow_name = name.lower().replace(" ", "-")
+            flow_path = out / f"flow-{safe_flow_name}.md"
             click.echo(f"\n  Flow: {name}")
+
+            if not _should_regenerate(flow_path, diff_paths=source_paths):
+                click.echo(f"  Unchanged — skipping.")
+                continue
 
             if batched:
                 prompt = build_flow_prompt_from_skeleton(
@@ -639,18 +828,20 @@ def synthesize(
 
             response = describe_file(prompt, model_tier=model_tier, max_tokens=8192)
 
-            safe_name = name.lower().replace(" ", "-")
-            article_path = out / f"flow-{safe_name}.md"
             article = render_article(
                 title=f"Flow: {name}",
                 content=response,
                 article_type="flow",
                 sources=source_hashes,
                 model=model_tier,
+                commit=record_commit,
+                commit_dirty=dirty,
             )
-            article_path.write_text(article)
-            click.echo(f"  -> {article_path.name}")
+            flow_path.write_text(article)
+            click.echo(f"  -> {flow_path.name}")
 
+    if skipped_articles:
+        click.echo(f"\nSkipped {skipped_articles} unchanged articles (use --force to regenerate).")
     click.echo("\nSynthesis complete.")
 
 

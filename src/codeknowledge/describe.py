@@ -127,6 +127,75 @@ def _append_element_list(
             _append_element_list(parts, elem.children, indent + 1)
 
 
+def count_elements(structure: FileStructure) -> int:
+    """Count total structural elements (recursive) in a file."""
+    def _count(elems: list[StructuralElement]) -> int:
+        total = 0
+        for e in elems:
+            total += 1
+            if e.children:
+                total += _count(e.children)
+        return total
+    return _count(structure.elements)
+
+
+def find_missing_elements(
+    structure: FileStructure,
+    described: FileDescription,
+) -> list[StructuralElement]:
+    """Return structural elements that were not described in the response."""
+    described_paths = {sym.scope_path for sym in described.symbols}
+    element_map = _build_element_map(structure.elements)
+    return [
+        elem for path, elem in element_map.items()
+        if path not in described_paths
+    ]
+
+
+def build_continuation_prompt(
+    structure: FileStructure,
+    source: str,
+    missing: list[StructuralElement],
+    project_name: str = "",
+) -> str:
+    """Build a follow-up prompt asking for descriptions of missing elements only."""
+    parts: list[str] = []
+
+    proj = f" from the project `{project_name}`" if project_name else ""
+    parts.append(
+        f"Here is the file `{structure.path}`{proj}. "
+        f"You already described some elements. Now describe the remaining ones.\n"
+    )
+
+    parts.append(f"\n### {structure.path}\n```{structure.language}\n{source}\n```\n")
+
+    parts.append("## Elements still needing descriptions\n")
+    parts.append(
+        "Produce a description for each of the following elements. "
+        "For each one, explain what it does, its key inputs and outputs, "
+        "and any notable implementation details.\n"
+    )
+    for elem in missing:
+        sig = f" — `{elem.signature}`" if elem.signature else ""
+        parts.append(f"- **{elem.scope_path}** ({elem.kind.value}){sig}\n")
+
+    parts.append("""
+## Output format
+
+Respond with ONLY the following structure (no code fences around the whole response):
+
+For each structural element, use a markdown heading with the scope path and write a description paragraph:
+
+### `scope_path`
+
+Description of what this element does...
+
+Use the exact scope paths listed above as heading text. Do not add elements that aren't listed. Do not include the raw source code in your response.
+""")
+
+    return "".join(parts)
+
+
 def parse_response(
     response_text: str,
     structure: FileStructure,

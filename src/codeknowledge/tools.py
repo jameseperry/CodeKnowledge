@@ -38,7 +38,8 @@ def init(repo_root: Path) -> None:
 
 
 def _ck_dir() -> Path:
-    assert _repo_root is not None, "Tools not initialized"
+    if _repo_root is None:
+        raise RuntimeError("No project loaded. Call open_project first.")
     return _repo_root / ".codeknowledge"
 
 

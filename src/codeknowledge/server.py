@@ -18,6 +18,14 @@ def main() -> None:
     )
     parser.add_argument("--host", default="127.0.0.1", help="HTTP host (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8767, help="HTTP port (default: 8767)")
+    parser.add_argument(
+        "--allow",
+        action="append",
+        default=[],
+        metavar="PATTERN",
+        help="Glob pattern for allowed project paths (repeatable). "
+        "Example: --allow '/home/james/dev/**'",
+    )
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
 
@@ -27,7 +35,7 @@ def main() -> None:
         logging.DEBUG if args.verbose else logging.INFO
     )
 
-    mcp = create_mcp_server()
+    mcp = create_mcp_server(allow=args.allow)
 
     if args.transport == "stdio":
         mcp.run(transport="stdio")

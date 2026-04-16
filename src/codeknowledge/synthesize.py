@@ -406,6 +406,84 @@ def parse_flows(response: str) -> list[tuple[str, str]]:
 
 
 # ---------------------------------------------------------------------------
+# Significance evaluation (incremental synthesis)
+# ---------------------------------------------------------------------------
+
+# Cap the diff text sent to the evaluator to keep the prompt small.
+DIFF_CAP = 30_000
+
+
+def build_significance_prompt(
+    article_title: str,
+    article_content: str,
+    diff_text: str,
+) -> str:
+    """Build a prompt asking whether a git diff warrants re-synthesizing an article.
+
+    Returns a prompt for a cheap LLM call (haiku-tier).
+    """
+    # Truncate the diff if it's huge — if the diff itself is massive,
+    # that's a strong signal that regeneration is needed.
+    if len(diff_text) > DIFF_CAP:
+        truncated = diff_text[:DIFF_CAP]
+        diff_section = (
+            f"```diff\n{truncated}\n```\n\n"
+            f"*(Diff truncated — {len(diff_text):,} chars total, showing first {DIFF_CAP:,})*\n"
+        )
+    else:
+        diff_section = f"```diff\n{diff_text}\n```\n"
+
+    return (
+        "You are evaluating whether a code change is significant enough to warrant "
+        "re-generating a synthesis article.\n\n"
+        f"## Existing article: {article_title}\n\n"
+        f"{article_content}\n\n"
+        f"## Code changes since this article was generated\n\n"
+        f"{diff_section}\n"
+        "Does this diff change the architectural understanding captured in the article above? "
+        "Consider: new/removed modules, changed APIs, altered data flows, modified key algorithms, "
+        "renamed core abstractions. Ignore: whitespace, comments, minor refactors, test-only changes, "
+        "formatting, version bumps.\n\n"
+        "Answer with exactly one line:\n"
+        "VERDICT: YES or NO\n"
+        "Then optionally a one-sentence reason.\n"
+    )
+
+
+def parse_significance_verdict(response: str) -> bool:
+    """Parse the evaluator response. Returns True if regeneration is needed."""
+    for line in response.strip().split("\n"):
+        line = line.strip().upper()
+        if line.startswith("VERDICT:"):
+            return "YES" in line
+    # If we can't parse, regenerate to be safe
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Frontmatter parsing
+# ---------------------------------------------------------------------------
+
+def parse_article_frontmatter(text: str) -> dict[str, str]:
+    """Parse simple YAML frontmatter from an article, returning flat key-value pairs.
+
+    Only handles top-level scalar values (not nested sources mapping).
+    """
+    result: dict[str, str] = {}
+    if not text.startswith("---"):
+        return result
+    end = text.find("---", 3)
+    if end < 0:
+        return result
+    for line in text[3:end].strip().split("\n"):
+        line = line.strip()
+        if ":" in line and not line.startswith(" "):
+            key, _, val = line.partition(":")
+            result[key.strip()] = val.strip().strip('"')
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
 
@@ -415,11 +493,15 @@ def render_article(
     article_type: str = "synthesis",
     sources: dict[str, str] | None = None,
     model: str = "",
+    commit: str | None = None,
+    commit_dirty: bool = False,
 ) -> str:
     """Render a synthesis article as markdown with YAML frontmatter.
 
     Args:
         sources: Mapping of relative path → content hash.
+        commit: Git commit SHA at generation time.
+        commit_dirty: True if working tree had uncommitted changes.
     """
     lines: list[str] = []
     lines.append("---")
@@ -427,6 +509,10 @@ def render_article(
     lines.append(f"type: {article_type}")
     if model:
         lines.append(f"model: {model}")
+    if commit:
+        lines.append(f"commit: {commit}")
+    if commit_dirty:
+        lines.append("commit_dirty: true")
     if sources:
         lines.append("sources:")
         for path, hash_val in sources.items():
