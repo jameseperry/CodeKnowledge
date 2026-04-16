@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
-import json
 import logging
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 
 import click
 
+from .config import Config
 from .model import FileStructure
 from .extractors import get_extractor
 from .extractors import python as _  # noqa: F401 — register extractor
@@ -30,8 +30,18 @@ def _extract_file(file_path: Path, repo_root: Path) -> FileStructure | None:
     return extractor.extract(source, rel_path)
 
 
-def _collect_files(path: Path, repo_root: Path) -> list[tuple[Path, FileStructure]]:
-    """Collect all extractable files under a path."""
+def _collect_files(
+    path: Path,
+    repo_root: Path,
+    exclude: list[str] | None = None,
+) -> list[tuple[Path, FileStructure]]:
+    """Collect all extractable files under a path.
+
+    Args:
+        path: File or directory to scan.
+        repo_root: Repository root for relative path computation.
+        exclude: Glob patterns to exclude (matched against relative paths).
+    """
     results = []
     if path.is_file():
         fs = _extract_file(path, repo_root)
@@ -42,7 +52,10 @@ def _collect_files(path: Path, repo_root: Path) -> list[tuple[Path, FileStructur
             if not file_path.is_file():
                 continue
             rel = file_path.relative_to(repo_root)
+            rel_str = str(rel)
             if any(p.startswith(".") for p in rel.parts):
+                continue
+            if exclude and any(fnmatch.fnmatch(rel_str, pat) for pat in exclude):
                 continue
             fs = _extract_file(file_path, repo_root)
             if fs:
@@ -54,8 +67,39 @@ def _file_hash(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()[:12]
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def _find_repo_root(start: Path) -> Path | None:
+    """Walk up from *start* looking for a directory that contains .codeknowledge/.
+
+    Returns the repo root Path, or None if not found.
+    """
+    cur = start if start.is_dir() else start.parent
+    for _ in range(20):  # safety bound
+        if (cur / ".codeknowledge").is_dir():
+            return cur
+        parent = cur.parent
+        if parent == cur:
+            break
+        cur = parent
+    return None
+
+
+def _resolve_root(repo_root_arg: str | None, target: Path) -> Path:
+    """Resolve the repository root, preferring explicit --repo-root, then
+    .codeknowledge/ detection, then falling back to the target directory."""
+    if repo_root_arg:
+        return Path(repo_root_arg).resolve()
+    found = _find_repo_root(target)
+    if found:
+        return found
+    return target if target.is_dir() else target.parent
+
+
+def _load_config(repo_root: Path) -> Config | None:
+    """Load config if .codeknowledge/ exists under repo_root."""
+    ck = repo_root / ".codeknowledge"
+    if ck.is_dir():
+        return Config.load(ck)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +183,7 @@ def _print_elements(elements, indent: int, show_body: bool) -> None:
 # ---------------------------------------------------------------------------
 
 @cli.command()
-@click.argument("path", type=click.Path(exists=True))
+@click.argument("path", type=click.Path(exists=True), required=False, default=None)
 @click.option("--repo-root", type=click.Path(exists=True), default=None,
               help="Repository root.")
 @click.option("--output-dir", type=click.Path(), default=None,
@@ -147,17 +191,17 @@ def _print_elements(elements, indent: int, show_body: bool) -> None:
 @click.option("--articles-dir", type=click.Path(exists=True), default=None,
               help="Directory with synthesis articles (architecture-overview.md). "
                    "Defaults to .codeknowledge/articles/ under repo root.")
-@click.option("--model", default="sonnet", help="Model tier: haiku, sonnet, opus, or a model name.")
+@click.option("--model", default=None, help="Model tier: haiku, sonnet, opus, or a model name.")
 @click.option("--dry-run", is_flag=True, help="Print the prompt without calling the LLM.")
 @click.option("--file-filter", default=None, help="Only process files matching this substring.")
 @click.pass_context
 def describe(
     ctx: click.Context,
-    path: str,
+    path: str | None,
     repo_root: str | None,
     output_dir: str | None,
     articles_dir: str | None,
-    model: str,
+    model: str | None,
     dry_run: bool,
     file_filter: str | None,
 ) -> None:
@@ -168,10 +212,21 @@ def describe(
     markdown files.
     """
     from .describe import build_prompt, parse_response, render_description_markdown
+    from .graph import CallGraph
     from .llm import describe_file
 
-    target = Path(path).resolve()
-    root = Path(repo_root).resolve() if repo_root else (target if target.is_dir() else target.parent)
+    target = Path(path).resolve() if path else Path.cwd().resolve()
+    root = _resolve_root(repo_root, target)
+    cfg = _load_config(root)
+
+    # Resolve source targets from config if no path given
+    if path is None and cfg and cfg.source_dirs:
+        targets = cfg.resolved_source_dirs()
+    else:
+        targets = [target]
+
+    model_tier = model or (cfg.model if cfg else "sonnet")
+    exclude = cfg.exclude if cfg else None
     out = Path(output_dir) if output_dir else root / ".codeknowledge" / "descriptions"
 
     # Load architecture context if available
@@ -193,7 +248,19 @@ def describe(
     else:
         click.echo("No architecture context found. Run 'synthesize' first for better descriptions.")
 
-    all_files = _collect_files(target, root)
+    # Load call graph for caller context
+    graph_dir = root / ".codeknowledge" / "graph"
+    call_graph: CallGraph | None = None
+    if graph_dir.is_dir():
+        call_graph = CallGraph.load(graph_dir)
+        click.echo(f"Loaded call graph: {len(call_graph.files)} files, "
+                   f"{sum(len(v) for v in call_graph._callers.values())} caller edges")
+    else:
+        click.echo("No call graph found. Run 'graph' first for caller context in descriptions.")
+
+    all_files: list[tuple[Path, FileStructure]] = []
+    for t in targets:
+        all_files.extend(_collect_files(t, root, exclude=exclude))
 
     # Group ALL files by directory for neighbor context (before filtering)
     dir_groups: dict[Path, list[tuple[Path, FileStructure]]] = {}
@@ -231,12 +298,18 @@ def describe(
             neighbor_ctx[sib_fs.path] = sib_source
             neighbor_chars += len(sib_source)
 
+        # Caller context from call graph
+        file_callers: dict[str, list[tuple[str, str]]] | None = None
+        if call_graph:
+            file_callers = call_graph.get_file_callers(rel) or None
+
         prompt = build_prompt(
             structure=fs,
             source=source,
             neighbor_context=neighbor_ctx if neighbor_ctx else None,
             architecture_context=architecture_context,
-            project_name=root.name,
+            project_name=cfg.project_name if cfg else root.name,
+            callers=file_callers,
         )
 
         if dry_run:
@@ -245,12 +318,12 @@ def describe(
             click.echo("--- End prompt ---")
             continue
 
-        response_text = describe_file(prompt, model_tier=model)
+        response_text = describe_file(prompt, model_tier=model_tier)
         desc = parse_response(response_text, fs)
         md = render_description_markdown(
             desc,
             source_hash=_file_hash(file_path),
-            model=model,
+            model=model_tier,
         )
 
         out_path = out / (rel + ".md")
@@ -270,9 +343,14 @@ def describe(
 
 @cli.command()
 @click.argument("path", type=click.Path(exists=True), default=".")
+@click.option("--project-name", default=None, help="Project name (stored in config).")
+@click.option("--source-dir", "source_dirs", multiple=True,
+              help="Source directories to index (relative to repo root). Repeatable.")
 @click.pass_context
-def init(ctx: click.Context, path: str) -> None:
+def init(ctx: click.Context, path: str, project_name: str | None, source_dirs: tuple[str, ...]) -> None:
     """Initialize a .codeknowledge directory in a repository."""
+    from .config import DEFAULT_EXCLUDE
+
     root = Path(path).resolve()
     ck_dir = root / ".codeknowledge"
 
@@ -284,11 +362,16 @@ def init(ctx: click.Context, path: str) -> None:
     (ck_dir / "descriptions").mkdir()
     (ck_dir / "articles").mkdir()
 
-    manifest = ck_dir / "manifest.json"
-    manifest.write_text(json.dumps({
-        "repo_root": str(root),
-        "created_at": _now_iso(),
-    }, indent=2) + "\n")
+    # Create default config
+    cfg = Config(
+        project_name=project_name or root.name,
+        source_dirs=list(source_dirs),
+        exclude=list(DEFAULT_EXCLUDE),
+        repo_root=root,
+        ck_dir=ck_dir,
+    )
+    cfg_path = cfg.save()
+    click.echo(f"Created {cfg_path.name} (edit to configure source dirs and exclusions)")
 
     # Add .codeknowledge to parent .gitignore
     gitignore = root / ".gitignore"
@@ -310,22 +393,22 @@ def init(ctx: click.Context, path: str) -> None:
 # ---------------------------------------------------------------------------
 
 @cli.command()
-@click.argument("path", type=click.Path(exists=True))
+@click.argument("path", type=click.Path(exists=True), required=False, default=None)
 @click.option("--repo-root", type=click.Path(exists=True), default=None,
               help="Repository root for relative paths.")
 @click.option("--output-dir", type=click.Path(), default=None,
               help="Output directory for articles. Defaults to .codeknowledge/articles/ under repo root.")
-@click.option("--model", default="sonnet", help="Model tier: haiku, sonnet, opus, or a model name.")
+@click.option("--model", default=None, help="Model tier: haiku, sonnet, opus, or a model name.")
 @click.option("--project-name", default=None, help="Project name for context.")
 @click.option("--dry-run", is_flag=True, help="Print prompts without calling the LLM.")
 @click.option("--skip-flows", is_flag=True, help="Skip flow document generation.")
 @click.pass_context
 def synthesize(
     ctx: click.Context,
-    path: str,
+    path: str | None,
     repo_root: str | None,
     output_dir: str | None,
-    model: str,
+    model: str | None,
     project_name: str | None,
     dry_run: bool,
     skip_flows: bool,
@@ -334,25 +417,49 @@ def synthesize(
 
     Extracts structure via tree-sitter, reads raw source, and produces
     an architecture overview and key flow documents.
+
+    For large projects, uses batched mode: generates per-module summaries
+    first (one directory at a time), then synthesizes architecture from
+    those summaries.
     """
     from .synthesize import (
         build_architecture_prompt,
+        build_architecture_from_summaries_prompt,
         build_flow_identification_prompt,
         build_flow_prompt,
+        build_flow_prompt_from_skeleton,
+        build_full_skeleton,
+        build_merge_summaries_prompt,
+        build_module_summary_prompt,
+        group_by_directory,
+        needs_batching,
         parse_flows,
         render_article,
+        split_module_batches,
     )
     from .llm import describe_file
 
-    target = Path(path).resolve()
-    root = Path(repo_root).resolve() if repo_root else (target if target.is_dir() else target.parent)
+    target = Path(path).resolve() if path else Path.cwd().resolve()
+    root = _resolve_root(repo_root, target)
+    cfg = _load_config(root)
+
     out = Path(output_dir).resolve() if output_dir else root / ".codeknowledge" / "articles"
     out.mkdir(parents=True, exist_ok=True)
 
-    proj = project_name or root.name
+    model_tier = model or (cfg.model if cfg else "sonnet")
+    proj = project_name or (cfg.project_name if cfg else root.name)
+    exclude = cfg.exclude if cfg else None
+
+    # Resolve source targets from config if no path given
+    if path is None and cfg and cfg.source_dirs:
+        targets = cfg.resolved_source_dirs()
+    else:
+        targets = [target]
 
     # Collect all files via tree-sitter extraction + raw source
-    extracted = _collect_files(target, root)
+    extracted: list[tuple[Path, FileStructure]] = []
+    for t in targets:
+        extracted.extend(_collect_files(t, root, exclude=exclude))
     if not extracted:
         click.echo("No extractable files found.", err=True)
         sys.exit(1)
@@ -362,12 +469,116 @@ def synthesize(
         source = file_path.read_text()
         files.append((fs, source))
 
+    # Build source hash map for provenance
+    source_hashes: dict[str, str] = {}
+    for file_path, fs in extracted:
+        source_hashes[fs.path] = _file_hash(file_path)
+
     click.echo(f"Collected {len(files)} source files.")
 
-    # ---- Step 1: Architecture overview ----
-    click.echo("\n--- Architecture overview ---")
+    batched = needs_batching(files)
+    if batched:
+        click.echo(f"Large project detected — using batched synthesis.\n")
 
-    arch_prompt = build_architecture_prompt(files=files, project_name=proj)
+    # ---- Step 1: Architecture overview ----
+    if batched:
+        # --- Batched mode: module summaries → architecture ---
+        skeleton = build_full_skeleton(files)
+        click.echo(f"Project skeleton: {len(skeleton)} chars")
+
+        groups = group_by_directory(files)
+        click.echo(f"Modules: {len(groups)} directories\n")
+
+        # Generate module summaries
+        module_summaries: dict[str, str] = {}
+        summaries_dir = out / "module-summaries"
+        summaries_dir.mkdir(parents=True, exist_ok=True)
+
+        for i, (dir_path, module_files) in enumerate(sorted(groups.items()), 1):
+            n_files = len(module_files)
+            n_chars = sum(len(s) for _, s in module_files)
+            click.echo(f"  [{i}/{len(groups)}] {dir_path} ({n_files} files, {n_chars:,} chars)")
+
+            batches = split_module_batches(module_files)
+
+            if len(batches) == 1:
+                # Single batch — normal path
+                prompt = build_module_summary_prompt(
+                    module_path=dir_path,
+                    module_files=module_files,
+                    project_skeleton=skeleton,
+                    project_name=proj,
+                )
+
+                if dry_run:
+                    click.echo(f"    Prompt: {len(prompt)} chars")
+                    continue
+
+                summary = describe_file(prompt, model_tier=model_tier, max_tokens=4096)
+            else:
+                # Multiple sub-batches — summarize each, then merge
+                click.echo(f"    Split into {len(batches)} sub-batches")
+                partial_summaries: list[str] = []
+
+                for j, batch in enumerate(batches, 1):
+                    batch_chars = sum(len(s) for _, s in batch)
+                    batch_files = len(batch)
+                    click.echo(f"    Batch {j}/{len(batches)}: {batch_files} files, {batch_chars:,} chars")
+
+                    prompt = build_module_summary_prompt(
+                        module_path=dir_path,
+                        module_files=batch,
+                        project_skeleton=skeleton,
+                        project_name=proj,
+                    )
+
+                    if dry_run:
+                        click.echo(f"      Prompt: {len(prompt)} chars")
+                        continue
+
+                    partial = describe_file(prompt, model_tier=model_tier, max_tokens=4096)
+                    partial_summaries.append(partial)
+
+                if dry_run:
+                    continue
+
+                # Merge partial summaries
+                click.echo(f"    Merging {len(partial_summaries)} partial summaries...")
+                merge_prompt = build_merge_summaries_prompt(
+                    module_path=dir_path,
+                    partial_summaries=partial_summaries,
+                    project_name=proj,
+                )
+                summary = describe_file(merge_prompt, model_tier=model_tier, max_tokens=4096)
+
+            module_summaries[dir_path] = summary
+
+            # Save module summary
+            safe_name = dir_path.replace("/", "_").replace("\\", "_") or "_root"
+            summary_path = summaries_dir / f"{safe_name}.md"
+            article = render_article(
+                title=f"Module: {dir_path}",
+                content=summary,
+                article_type="module-summary",
+                sources={fs.path: source_hashes[fs.path] for fs, _ in module_files},
+                model=model_tier,
+            )
+            summary_path.write_text(article)
+            click.echo(f"    -> {summary_path.relative_to(out)}")
+
+        if dry_run:
+            return
+
+        click.echo(f"\n--- Architecture overview (from {len(module_summaries)} module summaries) ---")
+        arch_prompt = build_architecture_from_summaries_prompt(
+            project_skeleton=skeleton,
+            module_summaries=module_summaries,
+            project_name=proj,
+        )
+    else:
+        # --- Single-pass mode ---
+        click.echo("\n--- Architecture overview ---")
+        arch_prompt = build_architecture_prompt(files=files, project_name=proj)
 
     if dry_run:
         click.echo(f"  Prompt: {len(arch_prompt)} chars")
@@ -375,16 +586,15 @@ def synthesize(
         click.echo("...")
         return
 
-    architecture = describe_file(arch_prompt, model_tier=model, max_tokens=8192)
+    architecture = describe_file(arch_prompt, model_tier=model_tier, max_tokens=8192)
 
     article_path = out / "architecture-overview.md"
-    sources = [fs.path for fs, _ in files]
     article = render_article(
         title="Architecture Overview",
         content=architecture,
         article_type="architecture",
-        sources=sources,
-        model=model,
+        sources=source_hashes,
+        model=model_tier,
     )
     article_path.write_text(article)
     click.echo(f"  -> {article_path.name}")
@@ -397,7 +607,7 @@ def synthesize(
             architecture=architecture,
             project_name=proj,
         )
-        flow_response = describe_file(flow_id_prompt, model_tier=model, max_tokens=2048)
+        flow_response = describe_file(flow_id_prompt, model_tier=model_tier, max_tokens=2048)
         flows = parse_flows(flow_response)
 
         click.echo(f"  Identified {len(flows)} flows.")
@@ -407,15 +617,25 @@ def synthesize(
         for name, description in flows:
             click.echo(f"\n  Flow: {name}")
 
-            prompt = build_flow_prompt(
-                flow_name=name,
-                flow_description=description,
-                files=files,
-                architecture=architecture,
-                project_name=proj,
-            )
+            if batched:
+                prompt = build_flow_prompt_from_skeleton(
+                    flow_name=name,
+                    flow_description=description,
+                    project_skeleton=skeleton,
+                    module_summaries=module_summaries,
+                    architecture=architecture,
+                    project_name=proj,
+                )
+            else:
+                prompt = build_flow_prompt(
+                    flow_name=name,
+                    flow_description=description,
+                    files=files,
+                    architecture=architecture,
+                    project_name=proj,
+                )
 
-            response = describe_file(prompt, model_tier=model, max_tokens=8192)
+            response = describe_file(prompt, model_tier=model_tier, max_tokens=8192)
 
             safe_name = name.lower().replace(" ", "-")
             article_path = out / f"flow-{safe_name}.md"
@@ -423,13 +643,229 @@ def synthesize(
                 title=f"Flow: {name}",
                 content=response,
                 article_type="flow",
-                sources=sources,
-                model=model,
+                sources=source_hashes,
+                model=model_tier,
             )
             article_path.write_text(article)
             click.echo(f"  -> {article_path.name}")
 
     click.echo("\nSynthesis complete.")
+
+
+# ---------------------------------------------------------------------------
+# graph — static call-graph extraction
+# ---------------------------------------------------------------------------
+
+@cli.command()
+@click.argument("path", type=click.Path(exists=True), required=False, default=None)
+@click.option("--repo-root", type=click.Path(exists=True), default=None,
+              help="Repository root for relative paths.")
+@click.option("--output-dir", type=click.Path(), default=None,
+              help="Output directory. Defaults to .codeknowledge/graph/ under repo root.")
+@click.pass_context
+def graph(
+    ctx: click.Context,
+    path: str | None,
+    repo_root: str | None,
+    output_dir: str | None,
+) -> None:
+    """Extract static call graphs from source files.
+
+    Produces per-file YAML files listing imports, functions, and the
+    calls each function makes, with best-effort resolution.
+    No LLM calls — purely tree-sitter based.
+    """
+    from .graph import build_graph
+
+    target = Path(path).resolve() if path else Path.cwd().resolve()
+    root = _resolve_root(repo_root, target)
+    cfg = _load_config(root)
+
+    exclude = cfg.exclude if cfg else None
+
+    # Resolve source targets
+    if path is None and cfg and cfg.source_dirs:
+        targets = cfg.resolved_source_dirs()
+    else:
+        targets = [target]
+
+    out = Path(output_dir).resolve() if output_dir else root / ".codeknowledge" / "graph"
+    out.mkdir(parents=True, exist_ok=True)
+
+    # Collect files
+    extracted: list[tuple[Path, str]] = []
+    for t in targets:
+        for file_path, fs in _collect_files(t, root, exclude=exclude):
+            extracted.append((file_path, fs.path))
+
+    if not extracted:
+        click.echo("No extractable files found.", err=True)
+        sys.exit(1)
+
+    click.echo(f"Extracting call graphs from {len(extracted)} files...")
+    count = build_graph(extracted, out)
+    click.echo(f"Graph extracted: {count} files -> {out}")
+
+
+# ---------------------------------------------------------------------------
+# index — build embedding index from articles/descriptions
+# ---------------------------------------------------------------------------
+
+@cli.command()
+@click.option("--articles-dir", type=click.Path(exists=True), default=None,
+              help="Directory with article markdown files.")
+@click.option("--descriptions-dir", type=click.Path(exists=True), default=None,
+              help="Directory with description markdown files.")
+@click.option("--db", "db_path", type=click.Path(), default=None,
+              help="Output database path. Defaults to codeknowledge.db next to articles.")
+@click.option("--model", "embed_model", default=None,
+              help="Sentence-transformer model name. Default: all-MiniLM-L6-v2.")
+@click.option("--repo-root", type=click.Path(exists=True), default=None,
+              help="Repository root (looks for .codeknowledge/ layout).")
+@click.pass_context
+def index(
+    ctx: click.Context,
+    articles_dir: str | None,
+    descriptions_dir: str | None,
+    db_path: str | None,
+    embed_model: str | None,
+    repo_root: str | None,
+) -> None:
+    """Build the embedding search index from articles and descriptions.
+
+    If --repo-root is given (or run from a repo with .codeknowledge/),
+    automatically finds articles/ and descriptions/ directories.
+    Otherwise, specify --articles-dir and/or --descriptions-dir explicitly.
+    """
+    from .index import build_index, DEFAULT_MODEL
+
+    # Resolve directories
+    a_dir: Path | None = Path(articles_dir).resolve() if articles_dir else None
+    d_dir: Path | None = Path(descriptions_dir).resolve() if descriptions_dir else None
+    db: Path | None = Path(db_path).resolve() if db_path else None
+
+    # Auto-detect from repo root
+    if a_dir is None and d_dir is None:
+        root = _resolve_root(repo_root, Path.cwd())
+        ck = root / ".codeknowledge"
+        if ck.is_dir():
+            a_candidate = ck / "articles"
+            d_candidate = ck / "descriptions"
+            if a_candidate.is_dir():
+                a_dir = a_candidate
+            if d_candidate.is_dir():
+                d_dir = d_candidate
+            if db is None:
+                db = ck / "codeknowledge.db"
+
+    if a_dir is None and d_dir is None:
+        click.echo(
+            "No documents found. Specify --articles-dir / --descriptions-dir, "
+            "or run from a repo with .codeknowledge/.",
+            err=True,
+        )
+        sys.exit(1)
+
+    model = embed_model or DEFAULT_MODEL
+
+    # Count documents
+    n_articles = len(list(a_dir.rglob("*.md"))) if a_dir else 0
+    n_descs = len(list(d_dir.rglob("*.md"))) if d_dir else 0
+    click.echo(f"Indexing: {n_articles} articles, {n_descs} descriptions")
+    click.echo(f"Embedding model: {model}")
+
+    result_path = build_index(
+        articles_dir=a_dir,
+        descriptions_dir=d_dir,
+        db_path=db,
+        model_name=model,
+    )
+
+    click.echo(f"\nIndex built: {result_path}")
+
+    # Print stats
+    import sqlite3
+    conn = sqlite3.connect(str(result_path))
+    n_docs = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+    n_chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    dim = conn.execute("SELECT value FROM meta WHERE key='embedding_dim'").fetchone()
+    conn.close()
+    click.echo(f"  {n_docs} documents, {n_chunks} chunks, {dim[0] if dim else '?'}d embeddings")
+
+
+# ---------------------------------------------------------------------------
+# search — semantic search over the index
+# ---------------------------------------------------------------------------
+
+@cli.command()
+@click.argument("query")
+@click.option("--db", "db_path", type=click.Path(exists=True), default=None,
+              help="Index database path.")
+@click.option("--repo-root", type=click.Path(exists=True), default=None,
+              help="Repository root (looks for .codeknowledge/codeknowledge.db).")
+@click.option("--top-k", default=5, type=int, help="Number of results to return.")
+@click.option("--verbose", "-v", "show_content", is_flag=True,
+              help="Show full chunk content in results.")
+@click.pass_context
+def search(
+    ctx: click.Context,
+    query: str,
+    db_path: str | None,
+    repo_root: str | None,
+    top_k: int,
+    show_content: bool,
+) -> None:
+    """Search the embedding index with a natural language query."""
+    from .index import search_index
+
+    # Resolve DB path
+    db: Path | None = Path(db_path).resolve() if db_path else None
+
+    if db is None:
+        root = _resolve_root(repo_root, Path.cwd())
+        candidate = root / ".codeknowledge" / "codeknowledge.db"
+        if candidate.exists():
+            db = candidate
+
+    if db is None or not db.exists():
+        click.echo(
+            "Index not found. Run 'codeknowledge index' first, "
+            "or specify --db path.",
+            err=True,
+        )
+        sys.exit(1)
+
+    results = search_index(query=query, db_path=db, top_k=top_k)
+
+    if not results:
+        click.echo("No results found.")
+        return
+
+    for i, r in enumerate(results, 1):
+        score = r["score"]
+        doc = r["document"]
+        heading = r["heading"]
+        doc_type = r["doc_type"]
+
+        # Header line
+        click.echo(f"\n{'─' * 60}")
+        click.echo(f"  [{i}] {score:.4f}  {doc}")
+        if heading:
+            click.echo(f"      § {heading}")
+        click.echo(f"      type: {doc_type}")
+
+        if show_content:
+            click.echo(f"{'─' * 60}")
+            # Truncate very long content for display
+            content = r["content"]
+            if len(content) > 1000:
+                content = content[:1000] + "\n... (truncated)"
+            click.echo(content)
+
+        elif r["content"]:
+            # Show first line as preview
+            preview = r["content"].split("\n")[0][:120]
+            click.echo(f"      {preview}")
 
 
 if __name__ == "__main__":

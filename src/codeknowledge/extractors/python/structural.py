@@ -5,8 +5,8 @@ from __future__ import annotations
 import tree_sitter_python as tspython
 from tree_sitter import Language, Parser, Node
 
-from ..model import ElementKind, FileStructure, Import, StructuralElement
-from . import Extractor, register_extractor
+from ...model import ElementKind, FileStructure, Import, StructuralElement
+from .. import Extractor, register_extractor
 
 
 class PythonExtractor(Extractor):

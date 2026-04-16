@@ -40,6 +40,7 @@ def build_prompt(
     neighbor_context: dict[str, str] | None = None,
     architecture_context: str | None = None,
     project_name: str = "",
+    callers: dict[str, list[tuple[str, str]]] | None = None,
 ) -> str:
     """Build the LLM prompt for describing a file.
 
@@ -49,6 +50,7 @@ def build_prompt(
         neighbor_context: {rel_path: source_or_summary} for neighboring files.
         architecture_context: Architecture overview text to inform descriptions.
         project_name: Name of the project for context.
+        callers: {qualified_name: [(caller_file, caller_name), ...]} from call graph.
     """
     parts: list[str] = []
 
@@ -77,6 +79,20 @@ def build_prompt(
         "and any notable implementation details.\n"
     )
     _append_element_list(parts, structure.elements, indent=0)
+
+    # Caller context from static call graph
+    if callers:
+        parts.append("\n## Known callers (from static analysis)\n\n")
+        parts.append(
+            "The following functions in this file are called by other functions. "
+            "Use this information to describe each function's role and importance.\n\n"
+        )
+        for func_name, caller_list in callers.items():
+            formatted = ", ".join(
+                f"`{cn}` ({cf})" for cf, cn in caller_list
+            )
+            parts.append(f"- `{func_name}` is called by: {formatted}\n")
+        parts.append("\n")
 
     # Output format instructions
     parts.append("""
