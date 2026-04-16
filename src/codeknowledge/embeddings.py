@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+import warnings
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 
@@ -53,12 +54,35 @@ class LocalEmbedder(Embedder):
         if self._model is None:
             from sentence_transformers import SentenceTransformer
 
-            log.info("Loading embedding model: %s", self._config.model_name)
-            self._model = SentenceTransformer(
-                self._config.model_name,
-                trust_remote_code=True,
-            )
-            log.info("Embedding model loaded.")
+            # Suppress all logging noise during model load (HF, httpx, torch)
+            root_logger = logging.getLogger()
+            saved_root_level = root_logger.level
+            root_logger.setLevel(logging.ERROR)
+
+            try:
+                # Try local cache first to avoid HF network round-trips
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    try:
+                        self._model = SentenceTransformer(
+                            self._config.model_name,
+                            trust_remote_code=True,
+                            local_files_only=True,
+                        )
+                    except OSError:
+                        # Model not cached yet — download it
+                        root_logger.setLevel(saved_root_level)
+                        log.info("Downloading embedding model: %s", self._config.model_name)
+                        root_logger.setLevel(logging.ERROR)
+                        self._model = SentenceTransformer(
+                            self._config.model_name,
+                            trust_remote_code=True,
+                        )
+            finally:
+                root_logger.setLevel(saved_root_level)
+
+            log.info("Embedding model loaded: %s", self._config.model_name)
+
         return self._model
 
     def embed_documents(self, texts: list[str]) -> np.ndarray:

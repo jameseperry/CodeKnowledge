@@ -18,7 +18,9 @@ from .extractors import python as _  # noqa: F401 — register extractor
 
 def _setup_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(level=level, format="%(levelname)s: %(message)s")
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
+    # Only make our own loggers verbose
+    logging.getLogger("codeknowledge").setLevel(level)
 
 
 def _extract_file(file_path: Path, repo_root: Path) -> FileStructure | None:
