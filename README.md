@@ -16,7 +16,13 @@ The results are served via an MCP server that provides tools for searching the k
 
 ## Installation
 
+Install from the repo with pipx (recommended) or pip:
+
 ```bash
+# pipx — isolated environment, available globally
+pipx install git+https://github.com/jameseperry/CodeKnowledge.git
+
+# or for local development
 pip install -e .
 ```
 
