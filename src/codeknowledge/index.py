@@ -380,6 +380,133 @@ def build_index(
 
 
 # ---------------------------------------------------------------------------
+# Code index building
+# ---------------------------------------------------------------------------
+
+def _chunk_element(
+    rel_path: str,
+    element,  # StructuralElement
+    parent_scope: str = "",
+) -> list[dict]:
+    """Recursively chunk a structural element into embeddable pieces."""
+    chunks: list[dict] = []
+    scope = element.scope_path or element.name
+
+    if element.body and element.kind.value in ("function", "method", "class", "struct"):
+        header = f"{rel_path} > {scope}"
+        embed_text = f"{header}\n{element.body}"
+        chunks.append({
+            "heading": scope,
+            "content": element.body,
+            "char_start": element.line_start,
+            "char_end": element.line_end,
+            "embed_text": embed_text,
+        })
+
+    for child in element.children:
+        chunks.extend(_chunk_element(rel_path, child, scope))
+
+    return chunks
+
+
+def _chunk_source_file(rel_path: str, file_structure) -> list[dict]:
+    """Chunk a parsed source file into embeddable code pieces.
+
+    Each function/method/class body becomes a chunk, with the file path
+    and scope path prepended for retrieval context.
+    """
+    chunks: list[dict] = []
+    for element in file_structure.elements:
+        chunks.extend(_chunk_element(rel_path, element))
+    return chunks
+
+
+def build_code_index(
+    file_structures: list,
+    db_path: Path,
+    embedding_config: EmbeddingConfig,
+) -> Path:
+    """Build the code embedding index from parsed source files.
+
+    Args:
+        file_structures: List of (FileStructure, source_text) tuples from
+            the extract step.
+        db_path: Path for the SQLite database.
+        embedding_config: Code embedding model configuration.
+
+    Returns:
+        Path to the created database.
+    """
+    all_chunks: list[tuple[str, dict]] = []  # (rel_path, chunk_dict)
+
+    for fs, _source in file_structures:
+        chunks = _chunk_source_file(fs.path, fs)
+        for chunk in chunks:
+            all_chunks.append((fs.path, chunk))
+
+    if not all_chunks:
+        raise ValueError("No code elements found to index.")
+
+    log.info("Code index: %d chunks from %d files", len(all_chunks), len(file_structures))
+
+    if db_path.exists():
+        db_path.unlink()
+
+    conn = _init_db(db_path)
+    embedder = get_embedder(embedding_config)
+
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?, ?)",
+        ("embedding_model", embedding_config.model_name),
+    )
+
+    for rel_path, chunk in all_chunks:
+        chash = _content_hash(chunk["content"])
+        # Upsert document (one per source file)
+        row = conn.execute("SELECT id FROM documents WHERE path = ?", (rel_path,)).fetchone()
+        if row:
+            doc_id = row[0]
+        else:
+            conn.execute(
+                "INSERT INTO documents (path, doc_type, title, content_hash) VALUES (?, ?, ?, ?)",
+                (rel_path, "code", "", chash),
+            )
+            doc_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+        conn.execute(
+            "INSERT INTO chunks (doc_id, heading, content, char_start, char_end) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (doc_id, chunk["heading"], chunk["content"],
+             chunk["char_start"], chunk["char_end"]),
+        )
+        chunk_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        chunk["chunk_id"] = chunk_id
+
+    # Embed all chunks
+    embed_texts = [chunk["embed_text"] for _, chunk in all_chunks]
+    log.info("Embedding %d code chunks...", len(embed_texts))
+    embeddings = embedder.embed_documents(embed_texts)
+
+    for i, (_, chunk) in enumerate(all_chunks):
+        blob = _serialize_embedding(embeddings[i])
+        conn.execute(
+            "INSERT INTO embeddings (chunk_id, embedding) VALUES (?, ?)",
+            (chunk["chunk_id"], blob),
+        )
+
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+        ("embedding_dim", str(embeddings.shape[1])),
+    )
+
+    conn.commit()
+    conn.close()
+
+    log.info("Code index built: %d chunks, %d dimensions", len(all_chunks), embeddings.shape[1])
+    return db_path
+
+
+# ---------------------------------------------------------------------------
 # Search
 # ---------------------------------------------------------------------------
 
@@ -388,22 +515,52 @@ def search_index(
     db_path: Path,
     top_k: int = 10,
     embedding_config: EmbeddingConfig | None = None,
+    code_db_path: Path | None = None,
+    code_embedding_config: EmbeddingConfig | None = None,
+    source: str = "all",
 ) -> list[dict]:
     """Search the embedding index for chunks matching a query.
 
     Args:
         query: Natural language search query.
-        db_path: Path to the SQLite index database.
+        db_path: Path to the SQLite index database (descriptions/articles).
         top_k: Number of results to return.
-        embedding_config: Embedding configuration. Uses defaults if not provided.
+        embedding_config: Embedding configuration for description index.
+        code_db_path: Optional path to the code embedding index.
+        code_embedding_config: Embedding configuration for code index.
+        source: Which index to search — ``"all"`` (default), ``"docs"``,
+            or ``"code"``.
 
     Returns:
         List of result dicts with score, document, doc_type, title,
         heading, and content.
     """
-    if not db_path.exists():
-        raise FileNotFoundError(f"Index not found: {db_path}")
+    results: list[dict] = []
 
+    # Search docs index
+    if source in ("all", "docs"):
+        if not db_path.exists():
+            raise FileNotFoundError(f"Index not found: {db_path}")
+        results = _search_single_db(query, db_path, embedding_config, top_k)
+
+    # Merge code index results if available
+    if source in ("all", "code"):
+        if code_db_path and code_db_path.exists() and code_embedding_config:
+            code_results = _search_single_db(query, code_db_path, code_embedding_config, top_k)
+            results.extend(code_results)
+            results.sort(key=lambda r: r["score"], reverse=True)
+            results = results[:top_k]
+
+    return results
+
+
+def _search_single_db(
+    query: str,
+    db_path: Path,
+    embedding_config: EmbeddingConfig | None,
+    top_k: int,
+) -> list[dict]:
+    """Search a single embedding database."""
     conn = sqlite3.connect(str(db_path))
 
     embedder = get_embedder(embedding_config)
@@ -426,12 +583,10 @@ def search_index(
         return []
 
     # Compute cosine similarities
-    chunk_ids = []
     chunk_meta = []
     vectors = []
 
     for chunk_id, blob, heading, content, doc_path, doc_type, title in rows:
-        chunk_ids.append(chunk_id)
         chunk_meta.append({
             "document": doc_path,
             "doc_type": doc_type,

@@ -483,6 +483,32 @@ def parse_article_frontmatter(text: str) -> dict[str, str]:
     return result
 
 
+def parse_article_sources(text: str) -> dict[str, str]:
+    """Parse the ``sources:`` mapping from article frontmatter.
+
+    Returns a dict of ``{relative_path: hash}`` or empty dict if no
+    sources section is found.
+    """
+    result: dict[str, str] = {}
+    if not text.startswith("---"):
+        return result
+    end = text.find("---", 3)
+    if end < 0:
+        return result
+    in_sources = False
+    for line in text[3:end].strip().split("\n"):
+        if line.startswith("sources:"):
+            in_sources = True
+            continue
+        if in_sources:
+            if line.startswith("  ") and ":" in line:
+                key, _, val = line.strip().partition(":")
+                result[key.strip()] = val.strip()
+            else:
+                in_sources = False
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------

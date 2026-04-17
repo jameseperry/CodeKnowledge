@@ -30,6 +30,16 @@ class EmbeddingConfig:
     api_url: str = ""  # only needed for remote
     batch_size: int = 128
     max_concurrent: int = 4
+    doc_prefix: str = "search_document: "
+    query_prefix: str = "search_query: "
+
+
+def _default_code_embedding() -> EmbeddingConfig:
+    return EmbeddingConfig(
+        model_name="jinaai/jina-embeddings-v2-base-code",
+        doc_prefix="",
+        query_prefix="",
+    )
 
 
 @dataclass
@@ -41,6 +51,7 @@ class Config:
     exclude: list[str] = field(default_factory=lambda: list(DEFAULT_EXCLUDE))
     model: str = "sonnet"
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
+    code_embedding: EmbeddingConfig = field(default_factory=_default_code_embedding)
 
     # Paths resolved at load time (not serialized)
     repo_root: Path = field(default_factory=lambda: Path("."), repr=False)
@@ -62,6 +73,18 @@ class Config:
 
         emb_raw = raw.get("embedding", {})
 
+        code_emb_raw = raw.get("code_embedding", {})
+        code_emb = EmbeddingConfig(
+            backend=code_emb_raw.get("backend", "local"),
+            model_name=code_emb_raw.get("model_name", "jinaai/jina-embeddings-v2-base-code"),
+            dimensions=code_emb_raw.get("dimensions", 768),
+            api_url=code_emb_raw.get("api_url", ""),
+            batch_size=code_emb_raw.get("batch_size", 128),
+            max_concurrent=code_emb_raw.get("max_concurrent", 4),
+            doc_prefix=code_emb_raw.get("doc_prefix", ""),
+            query_prefix=code_emb_raw.get("query_prefix", ""),
+        )
+
         return cls(
             project_name=raw.get("project_name", repo_root.name),
             source_dirs=raw.get("source_dirs", []),
@@ -74,7 +97,10 @@ class Config:
                 api_url=emb_raw.get("api_url", ""),
                 batch_size=emb_raw.get("batch_size", 128),
                 max_concurrent=emb_raw.get("max_concurrent", 4),
+                doc_prefix=emb_raw.get("doc_prefix", "search_document: "),
+                query_prefix=emb_raw.get("query_prefix", "search_query: "),
             ),
+            code_embedding=code_emb,
             repo_root=repo_root,
             ck_dir=ck_dir,
         )
@@ -92,24 +118,34 @@ class Config:
         data["exclude"] = self.exclude
         data["model"] = self.model
 
-        # Only serialize embedding if non-default
+        # Always serialize embedding sections
         emb = self.embedding
-        default_emb = EmbeddingConfig()
-        emb_data: dict = {}
-        if emb.backend != default_emb.backend:
-            emb_data["backend"] = emb.backend
-        if emb.model_name != default_emb.model_name:
-            emb_data["model_name"] = emb.model_name
-        if emb.dimensions != default_emb.dimensions:
-            emb_data["dimensions"] = emb.dimensions
+        data["embedding"] = {
+            "backend": emb.backend,
+            "model_name": emb.model_name,
+        }
+        if emb.dimensions != 768:
+            data["embedding"]["dimensions"] = emb.dimensions
         if emb.api_url:
-            emb_data["api_url"] = emb.api_url
-        if emb.batch_size != default_emb.batch_size:
-            emb_data["batch_size"] = emb.batch_size
-        if emb.max_concurrent != default_emb.max_concurrent:
-            emb_data["max_concurrent"] = emb.max_concurrent
-        if emb_data:
-            data["embedding"] = emb_data
+            data["embedding"]["api_url"] = emb.api_url
+        if emb.doc_prefix != "search_document: ":
+            data["embedding"]["doc_prefix"] = emb.doc_prefix
+        if emb.query_prefix != "search_query: ":
+            data["embedding"]["query_prefix"] = emb.query_prefix
+
+        ce = self.code_embedding
+        data["code_embedding"] = {
+            "backend": ce.backend,
+            "model_name": ce.model_name,
+        }
+        if ce.dimensions != 768:
+            data["code_embedding"]["dimensions"] = ce.dimensions
+        if ce.api_url:
+            data["code_embedding"]["api_url"] = ce.api_url
+        if ce.doc_prefix:
+            data["code_embedding"]["doc_prefix"] = ce.doc_prefix
+        if ce.query_prefix:
+            data["code_embedding"]["query_prefix"] = ce.query_prefix
 
         config_path.write_text(yaml.dump(data, default_flow_style=False, sort_keys=False))
         return config_path

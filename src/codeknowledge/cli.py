@@ -402,7 +402,7 @@ def init(ctx: click.Context, path: str, project_name: str | None, source_dirs: t
 
     # Create .gitignore inside .codeknowledge to exclude the binary index
     ck_gitignore = ck_dir / ".gitignore"
-    ck_gitignore.write_text("# Binary embedding index (regenerate with 'codeknowledge index')\ncodeknowledge.db\n")
+    ck_gitignore.write_text("# Binary embedding indexes (regenerate with 'codeknowledge index')\ncodeknowledge.db\ncodeknowledge-code.db\n")
     click.echo("Created .codeknowledge/.gitignore (excludes codeknowledge.db)")
 
     # Create default config
@@ -476,17 +476,16 @@ def synthesize(
         build_full_skeleton,
         build_merge_summaries_prompt,
         build_module_summary_prompt,
-        build_significance_prompt,
         group_by_directory,
         needs_batching,
         parse_article_frontmatter,
+        parse_article_sources,
         parse_flows,
-        parse_significance_verdict,
         render_article,
         split_module_batches,
     )
     from .llm import describe_file
-    from .git import get_head_commit, has_uncommitted_changes, get_diff, is_git_repo
+    from .git import get_head_commit, has_uncommitted_changes, is_git_repo
 
     target = Path(path).resolve() if path else Path.cwd().resolve()
     root = _resolve_root(repo_root, target)
@@ -545,45 +544,33 @@ def synthesize(
     record_commit = head_commit if (head_commit and not dirty) else None
     skipped_articles = 0
 
-    def _should_regenerate(article_path: Path, diff_paths: list[str] | None = None) -> bool:
-        """Check if an existing article should be regenerated based on git diff."""
+    def _should_regenerate(article_path: Path, relevant_hashes: dict[str, str] | None = None) -> bool:
+        """Check if an existing article should be regenerated based on source hashes."""
         nonlocal skipped_articles
-        if force or not git_available or not head_commit:
+        if force:
             return True
         if not article_path.exists():
             return True
         existing = article_path.read_text()
-        fm = parse_article_frontmatter(existing)
-        stored_commit = fm.get("commit")
-        if not stored_commit:
-            return True
-        if fm.get("commit_dirty") == "true":
-            return True
-        # Get diff since the stored commit
-        diff = get_diff(root, stored_commit, paths=diff_paths)
-        if diff is None:
-            return True  # git error — regenerate to be safe
-        if not diff.strip():
-            skipped_articles += 1
-            return False  # no changes
-        # Ask the LLM if the diff is significant
-        title = fm.get("title", article_path.stem)
-        # Extract content after frontmatter
-        content_start = existing.find("---", 3)
-        if content_start >= 0:
-            content = existing[content_start + 3:].strip()
-        else:
-            content = existing
-        eval_prompt = build_significance_prompt(title, content, diff)
-        click.echo(f"    Evaluating significance ({len(diff):,} chars of diff)...")
-        verdict_response = describe_file(eval_prompt, model_tier="haiku", max_tokens=256)
-        significant = parse_significance_verdict(verdict_response)
-        if not significant:
-            skipped_articles += 1
-            click.echo(f"    Diff not significant — skipping.")
-        else:
-            click.echo(f"    Diff is significant — regenerating.")
-        return significant
+        stored_sources = parse_article_sources(existing)
+        if not stored_sources:
+            return True  # no hashes stored → must regenerate
+
+        check_against = relevant_hashes if relevant_hashes is not None else source_hashes
+        for path, stored_hash in stored_sources.items():
+            current = check_against.get(path)
+            if current is None:
+                return True
+            if current != stored_hash:
+                return True
+
+        if relevant_hashes is not None:
+            for path in relevant_hashes:
+                if path not in stored_sources:
+                    return True
+
+        skipped_articles += 1
+        return False
 
     batched = needs_batching(files)
     if batched:
@@ -613,8 +600,9 @@ def synthesize(
             safe_name = dir_path.replace("/", "_").replace("\\", "_") or "_root"
             summary_path = summaries_dir / f"{safe_name}.md"
             module_source_paths = [fs.path for fs, _ in module_files]
+            module_hashes = {p: source_hashes[p] for p in module_source_paths if p in source_hashes}
 
-            if not _should_regenerate(summary_path, diff_paths=module_source_paths):
+            if not _should_regenerate(summary_path, relevant_hashes=module_hashes):
                 click.echo(f"    Unchanged — reusing cached summary.")
                 existing = summary_path.read_text()
                 content_start = existing.find("---", 3)
@@ -708,7 +696,7 @@ def synthesize(
         arch_path = out / "architecture-overview.md"
         if not any_summary_regenerated and arch_path.exists() and not force:
             click.echo("  No module summaries changed — checking architecture...")
-            if not _should_regenerate(arch_path, diff_paths=source_paths):
+            if not _should_regenerate(arch_path, relevant_hashes=source_hashes):
                 click.echo("  Architecture unchanged — skipping.")
                 # Load existing architecture for flow generation
                 existing = arch_path.read_text()
@@ -740,7 +728,7 @@ def synthesize(
         # --- Single-pass mode ---
         click.echo("\n--- Architecture overview ---")
         arch_path = out / "architecture-overview.md"
-        if not _should_regenerate(arch_path, diff_paths=source_paths):
+        if not _should_regenerate(arch_path, relevant_hashes=source_hashes):
             click.echo("  Architecture unchanged — skipping.")
             existing = arch_path.read_text()
             content_start = existing.find("---", 3)
@@ -804,7 +792,7 @@ def synthesize(
             flow_path = out / f"flow-{safe_flow_name}.md"
             click.echo(f"\n  Flow: {name}")
 
-            if not _should_regenerate(flow_path, diff_paths=source_paths):
+            if not _should_regenerate(flow_path, relevant_hashes=source_hashes):
                 click.echo(f"  Unchanged — skipping.")
                 continue
 
@@ -1001,6 +989,31 @@ def index(
     conn.close()
     click.echo(f"  {n_docs} documents, {n_chunks} chunks, {dim[0] if dim else '?'}d embeddings")
 
+    # Build code index if configured
+    if cfg and cfg.code_embedding:
+        from .index import build_code_index
+
+        click.echo(f"\nCode embedding model: {cfg.code_embedding.model_name} ({cfg.code_embedding.backend})")
+        source_targets = cfg.resolved_source_dirs() if cfg.source_dirs else [root]
+        extracted = []
+        for t in source_targets:
+            extracted.extend(_collect_files(t, root, exclude=cfg.exclude))
+
+        if extracted:
+            file_structures = [(fs, fp.read_text()) for fp, fs in extracted]
+            code_db = ck / "codeknowledge-code.db"
+            code_result = build_code_index(
+                file_structures=file_structures,
+                db_path=code_db,
+                embedding_config=cfg.code_embedding,
+            )
+            conn = sqlite3.connect(str(code_result))
+            n_code_chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+            code_dim = conn.execute("SELECT value FROM meta WHERE key='embedding_dim'").fetchone()
+            conn.close()
+            click.echo(f"Code index built: {code_result}")
+            click.echo(f"  {n_code_chunks} chunks, {code_dim[0] if code_dim else '?'}d embeddings")
+
 
 # ---------------------------------------------------------------------------
 # search — semantic search over the index
@@ -1013,6 +1026,8 @@ def index(
 @click.option("--repo-root", type=click.Path(exists=True), default=None,
               help="Repository root (looks for .codeknowledge/codeknowledge.db).")
 @click.option("--top-k", default=5, type=int, help="Number of results to return.")
+@click.option("--source", "source", type=click.Choice(["all", "docs", "code"]),
+              default="all", help="Which index to search (default: all).")
 @click.option("--verbose", "-v", "show_content", is_flag=True,
               help="Show full chunk content in results.")
 @click.pass_context
@@ -1022,6 +1037,7 @@ def search(
     db_path: str | None,
     repo_root: str | None,
     top_k: int,
+    source: str,
     show_content: bool,
 ) -> None:
     """Search the embedding index with a natural language query."""
@@ -1047,7 +1063,21 @@ def search(
         sys.exit(1)
 
     emb_cfg = cfg.embedding if cfg else None
-    results = search_index(query=query, db_path=db, top_k=top_k, embedding_config=emb_cfg)
+
+    # Check for code index
+    code_db: Path | None = None
+    code_emb_cfg = None
+    if cfg and cfg.code_embedding and db:
+        candidate_code = db.parent / "codeknowledge-code.db"
+        if candidate_code.exists():
+            code_db = candidate_code
+            code_emb_cfg = cfg.code_embedding
+
+    results = search_index(
+        query=query, db_path=db, top_k=top_k, embedding_config=emb_cfg,
+        code_db_path=code_db, code_embedding_config=code_emb_cfg,
+        source=source,
+    )
 
     if not results:
         click.echo("No results found.")
@@ -1160,16 +1190,15 @@ def update(
         build_full_skeleton,
         build_merge_summaries_prompt,
         build_module_summary_prompt,
-        build_significance_prompt,
         group_by_directory,
         needs_batching,
         parse_article_frontmatter,
+        parse_article_sources,
         parse_flows,
-        parse_significance_verdict,
         render_article,
         split_module_batches,
     )
-    from .git import get_head_commit, has_uncommitted_changes, get_diff, is_git_repo
+    from .git import get_head_commit, has_uncommitted_changes, is_git_repo
     from .config import EmbeddingConfig
 
     t_start = time.monotonic()
@@ -1278,34 +1307,41 @@ def update(
         synth_generated = 0
         synth_cached = 0
 
-        def _synth_should_regen(article_path: Path, diff_paths: list[str] | None = None) -> bool:
+        def _synth_should_regen(article_path: Path, relevant_hashes: dict[str, str] | None = None) -> bool:
+            """Check if a synthesis article needs regeneration.
+
+            Compares stored source hashes against current hashes.  If all
+            relevant source files are unchanged, skip.
+            """
             nonlocal synth_cached
-            if force or not git_available or not head_commit:
+            if force:
                 return True
             if not article_path.exists():
                 return True
+
             existing = article_path.read_text()
-            fm = parse_article_frontmatter(existing)
-            stored_commit = fm.get("commit")
-            if not stored_commit:
-                return True
-            if fm.get("commit_dirty") == "true":
-                return True
-            diff = get_diff(root, stored_commit, paths=diff_paths)
-            if diff is None:
-                return True
-            if not diff.strip():
-                synth_cached += 1
-                return False
-            title = fm.get("title", article_path.stem)
-            content_start = existing.find("---", 3)
-            content = existing[content_start + 3:].strip() if content_start >= 0 else existing
-            eval_prompt = build_significance_prompt(title, content, diff)
-            verdict_response = describe_file(eval_prompt, model_tier="haiku", max_tokens=256)
-            significant = parse_significance_verdict(verdict_response)
-            if not significant:
-                synth_cached += 1
-            return significant
+            stored_sources = parse_article_sources(existing)
+            if not stored_sources:
+                return True  # no hashes stored → must regenerate
+
+            # Compare against the relevant subset of current hashes
+            check_against = relevant_hashes if relevant_hashes is not None else source_hashes
+            for path, stored_hash in stored_sources.items():
+                current = check_against.get(path)
+                if current is None:
+                    # File was removed or renamed
+                    return True
+                if current != stored_hash:
+                    return True
+
+            # Check if new files were added that this article should cover
+            if relevant_hashes is not None:
+                for path in relevant_hashes:
+                    if path not in stored_sources:
+                        return True
+
+            synth_cached += 1
+            return False
 
         batched = needs_batching(files)
 
@@ -1321,8 +1357,9 @@ def update(
                 safe_name = dir_path.replace("/", "_").replace("\\", "_") or "_root"
                 summary_path = summaries_dir / f"{safe_name}.md"
                 module_source_paths = [fs.path for fs, _ in module_files]
+                module_hashes = {p: source_hashes[p] for p in module_source_paths if p in source_hashes}
 
-                if not _synth_should_regen(summary_path, diff_paths=module_source_paths):
+                if not _synth_should_regen(summary_path, relevant_hashes=module_hashes):
                     existing = summary_path.read_text()
                     content_start = existing.find("---", 3)
                     if content_start >= 0:
@@ -1378,7 +1415,7 @@ def update(
             # Architecture
             arch_path = articles_dir / "architecture-overview.md"
             arch_regenerated = False
-            if not any_summary_regenerated and not _synth_should_regen(arch_path, diff_paths=source_paths):
+            if not any_summary_regenerated and not _synth_should_regen(arch_path, relevant_hashes=source_hashes):
                 existing = arch_path.read_text()
                 content_start = existing.find("---", 3)
                 if content_start >= 0:
@@ -1408,7 +1445,7 @@ def update(
             # Single-pass
             arch_path = articles_dir / "architecture-overview.md"
             arch_regenerated = False
-            if not _synth_should_regen(arch_path, diff_paths=source_paths):
+            if not _synth_should_regen(arch_path, relevant_hashes=source_hashes):
                 existing = arch_path.read_text()
                 content_start = existing.find("---", 3)
                 if content_start >= 0:
@@ -1433,39 +1470,54 @@ def update(
 
         # Flows
         if not skip_flows:
-            flow_id_prompt = build_flow_identification_prompt(
-                architecture=architecture, project_name=proj,
-            )
-            flow_response = describe_file(flow_id_prompt, model_tier=model_tier, max_tokens=2048)
-            flow_list = parse_flows(flow_response)
+            # Check if any existing flow articles need regeneration before
+            # calling the LLM to identify flows (which is expensive).
+            existing_flows = sorted(articles_dir.glob("flow-*.md"))
+            any_flow_stale = arch_regenerated  # new arch → always re-identify
 
-            for name, description in flow_list:
-                safe_flow_name = name.lower().replace(" ", "-")
-                flow_path = articles_dir / f"flow-{safe_flow_name}.md"
+            if not any_flow_stale and not existing_flows:
+                any_flow_stale = True  # no flows yet → need to identify
 
-                if not _synth_should_regen(flow_path, diff_paths=source_paths):
-                    continue
+            if not any_flow_stale:
+                for fp in existing_flows:
+                    if _synth_should_regen(fp, relevant_hashes=source_hashes):
+                        any_flow_stale = True
+                        break
 
-                if batched:
-                    prompt = build_flow_prompt_from_skeleton(
-                        flow_name=name, flow_description=description,
-                        project_skeleton=skeleton, module_summaries=module_summaries,
-                        architecture=architecture, project_name=proj,
-                    )
-                else:
-                    prompt = build_flow_prompt(
-                        flow_name=name, flow_description=description,
-                        files=files, architecture=architecture, project_name=proj,
-                    )
-
-                response = describe_file(prompt, model_tier=model_tier, max_tokens=8192)
-                synth_generated += 1
-                article = render_article(
-                    title=f"Flow: {name}", content=response,
-                    article_type="flow", sources=source_hashes,
-                    model=model_tier, commit=record_commit, commit_dirty=dirty,
+            if any_flow_stale:
+                flow_id_prompt = build_flow_identification_prompt(
+                    architecture=architecture, project_name=proj,
                 )
-                flow_path.write_text(article)
+                flow_response = describe_file(flow_id_prompt, model_tier=model_tier, max_tokens=2048)
+                flow_list = parse_flows(flow_response)
+
+                for name, description in flow_list:
+                    safe_flow_name = name.lower().replace(" ", "-")
+                    flow_path = articles_dir / f"flow-{safe_flow_name}.md"
+
+                    if not _synth_should_regen(flow_path, relevant_hashes=source_hashes):
+                        continue
+
+                    if batched:
+                        prompt = build_flow_prompt_from_skeleton(
+                            flow_name=name, flow_description=description,
+                            project_skeleton=skeleton, module_summaries=module_summaries,
+                            architecture=architecture, project_name=proj,
+                        )
+                    else:
+                        prompt = build_flow_prompt(
+                            flow_name=name, flow_description=description,
+                            files=files, architecture=architecture, project_name=proj,
+                        )
+
+                    response = describe_file(prompt, model_tier=model_tier, max_tokens=8192)
+                    synth_generated += 1
+                    article = render_article(
+                        title=f"Flow: {name}", content=response,
+                        article_type="flow", sources=source_hashes,
+                        model=model_tier, commit=record_commit, commit_dirty=dirty,
+                    )
+                    flow_path.write_text(article)
 
         dt = time.monotonic() - t0
         parts = []
@@ -1617,9 +1669,28 @@ def update(
         conn.close()
         dim = dim_row[0] if dim_row else "?"
 
+        detail_parts = [f"{n_chunks} chunks · {dim}d"]
+
+        # Build code index if configured
+        if cfg and cfg.code_embedding:
+            from .index import build_code_index
+
+            code_db = ck_dir / "codeknowledge-code.db"
+            code_result = build_code_index(
+                file_structures=files,
+                db_path=code_db,
+                embedding_config=cfg.code_embedding,
+            )
+            conn = sqlite3.connect(str(code_result))
+            n_code = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+            code_dim_row = conn.execute("SELECT value FROM meta WHERE key='embedding_dim'").fetchone()
+            conn.close()
+            code_dim = code_dim_row[0] if code_dim_row else "?"
+            detail_parts.append(f"+ {n_code} code · {code_dim}d")
+
         dt = time.monotonic() - t0
         click.echo("\r" + _step_line(step, n_steps, "Index", "done",
-                                      f"{n_chunks} chunks · {dim}d ({dt:.1f}s)"))
+                                      f"{' '.join(detail_parts)} ({dt:.1f}s)"))
 
     # ---- Summary ----
     total_time = time.monotonic() - t_start

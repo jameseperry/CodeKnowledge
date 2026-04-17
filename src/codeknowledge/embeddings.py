@@ -86,7 +86,8 @@ class LocalEmbedder(Embedder):
         return self._model
 
     def embed_documents(self, texts: list[str]) -> np.ndarray:
-        prefixed = [f"search_document: {text}" for text in texts]
+        prefix = self._config.doc_prefix
+        prefixed = [f"{prefix}{text}" for text in texts]
         model = self._get_model()
         return model.encode(
             prefixed, normalize_embeddings=True,
@@ -94,7 +95,8 @@ class LocalEmbedder(Embedder):
         )
 
     def embed_query(self, text: str) -> np.ndarray:
-        prefixed = [f"search_query: {text}"]
+        prefix = self._config.query_prefix
+        prefixed = [f"{prefix}{text}"]
         model = self._get_model()
         result = model.encode(
             prefixed, normalize_embeddings=True,
@@ -188,12 +190,14 @@ class APIEmbedder(Embedder):
         return all_vectors
 
     def embed_documents(self, texts: list[str]) -> np.ndarray:
-        prefixed = [f"search_document: {text}" for text in texts]
+        prefix = self._config.doc_prefix
+        prefixed = [f"{prefix}{text}" for text in texts]
         vectors = self._embed(prefixed)
         return np.array(vectors, dtype=np.float32)
 
     def embed_query(self, text: str) -> np.ndarray:
-        prefixed = [f"search_query: {text}"]
+        prefix = self._config.query_prefix
+        prefixed = [f"{prefix}{text}"]
         vectors = self._embed(prefixed)
         return np.array(vectors[0], dtype=np.float32)
 
@@ -203,28 +207,32 @@ class APIEmbedder(Embedder):
 
 
 # ---------------------------------------------------------------------------
-# Singleton factory
+# Embedder cache (keyed by model + backend)
 # ---------------------------------------------------------------------------
 
-_embedder: Embedder | None = None
+_embedders: dict[str, Embedder] = {}
 
 
 def get_embedder(config: EmbeddingConfig | None = None) -> Embedder:
-    """Return the singleton embedder, creating it from config if needed."""
-    global _embedder
-    if _embedder is None:
-        if config is None:
-            config = EmbeddingConfig()
+    """Return an embedder for the given config, creating it if needed.
+
+    Embedders are cached by (backend, model_name) so multiple calls with
+    the same config share a single instance.
+    """
+    if config is None:
+        config = EmbeddingConfig()
+    key = f"{config.backend}:{config.model_name}"
+    if key not in _embedders:
         if config.backend == "remote":
             if not config.api_url:
                 raise ValueError("embedding.api_url is required when backend is 'remote'")
-            _embedder = APIEmbedder(config)
+            _embedders[key] = APIEmbedder(config)
         else:
-            _embedder = LocalEmbedder(config)
-    return _embedder
+            _embedders[key] = LocalEmbedder(config)
+    return _embedders[key]
 
 
 def reset_embedder() -> None:
-    """Reset the singleton (for testing or config changes)."""
-    global _embedder
-    _embedder = None
+    """Reset all cached embedders."""
+    global _embedders
+    _embedders = {}

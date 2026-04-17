@@ -50,12 +50,15 @@ def _ck_dir() -> Path:
 async def search_codebase(
     query: Annotated[str, Field(description="Natural language search query about the codebase")],
     limit: Annotated[int, Field(description="Maximum number of results to return")] = 5,
+    source: Annotated[str, Field(description="Which index to search: 'all' (default), 'docs' (descriptions and articles only), or 'code' (raw source code only)")] = "all",
 ) -> dict:
-    """Semantic search over codebase knowledge articles and file descriptions.
+    """Semantic search over codebase knowledge articles, file descriptions, and source code.
 
     Returns ranked results with relevance scores, document paths, heading
     context, and content snippets. Use this to find information about how
     the codebase works, what specific functions do, or architectural patterns.
+    Use source='code' to search raw source code, or source='docs' for
+    descriptions and architecture articles only.
     """
     from .index import search_index
     from .embeddings import reset_embedder
@@ -65,7 +68,20 @@ async def search_codebase(
         return {"error": "Search index not found. Run 'codeknowledge index' first."}
 
     emb_cfg = _config.embedding if _config else None
-    results = search_index(query=query, db_path=db_path, top_k=limit, embedding_config=emb_cfg)
+
+    # Check for code index
+    code_db_path = _ck_dir() / "codeknowledge-code.db"
+    code_emb_cfg = None
+    if _config and _config.code_embedding and code_db_path.exists():
+        code_emb_cfg = _config.code_embedding
+    else:
+        code_db_path = None
+
+    results = search_index(
+        query=query, db_path=db_path, top_k=limit, embedding_config=emb_cfg,
+        code_db_path=code_db_path, code_embedding_config=code_emb_cfg,
+        source=source,
+    )
 
     if not results:
         return {"results": [], "message": "No results found."}
