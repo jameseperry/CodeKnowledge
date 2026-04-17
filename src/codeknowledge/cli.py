@@ -1138,7 +1138,7 @@ def update(
 ) -> None:
     """Run the full knowledge-building pipeline.
 
-    Sequentially runs: extract → graph → describe → synthesize → index.
+    Sequentially runs: extract → graph → synthesize → describe → index.
     Each step reuses incremental caching where possible.
     """
     import sqlite3
@@ -1194,7 +1194,7 @@ def update(
     else:
         targets = [target]
 
-    steps = ["Extract", "Graph", "Describe", "Synthesize", "Index"]
+    steps = ["Extract", "Graph", "Synthesize", "Describe", "Index"]
     n_steps = len(steps)
 
     click.echo(_box(f"CodeKnowledge · {proj}"))
@@ -1260,121 +1260,8 @@ def update(
         click.echo("\r" + _step_line(step, n_steps, "Graph", "done",
                                       f"{n_graph} files, {n_edges} edges ({dt:.1f}s)"))
 
-    # ---- Step 3: Describe ----
+    # ---- Step 3: Synthesize ----
     step = 3
-    desc_dir = ck_dir / "descriptions"
-    desc_dir.mkdir(parents=True, exist_ok=True)
-    if "describe" in skip:
-        click.echo(_step_line(step, n_steps, "Describe", "skip", "skipped"))
-    else:
-        click.echo(_step_line(step, n_steps, "Describe", "running"), nl=False)
-        t0 = time.monotonic()
-
-        # Load architecture context
-        arch_dir = ck_dir / "articles"
-        architecture_context: str | None = None
-        arch_file = arch_dir / "architecture-overview.md"
-        if arch_file.is_file():
-            raw = arch_file.read_text()
-            if raw.startswith("---"):
-                end = raw.find("---", 3)
-                if end != -1:
-                    architecture_context = raw[end + 3:].strip()
-
-        # Load call graph
-        if not ("graph" in skip) and graph_dir.is_dir():
-            if "call_graph" not in dir():
-                call_graph = CallGraph.load(graph_dir)
-        elif graph_dir.is_dir():
-            call_graph = CallGraph.load(graph_dir)
-        else:
-            call_graph = None
-
-        # Group files by directory for neighbor context
-        dir_groups: dict[Path, list[tuple[Path, FileStructure]]] = {}
-        for file_path, fs in extracted:
-            dir_groups.setdefault(file_path.parent, []).append((file_path, fs))
-
-        desc_generated = 0
-        desc_cached = 0
-
-        for file_path, fs in extracted:
-            rel = fs.path
-            out_path = desc_dir / (rel + ".md")
-            current_hash = _file_hash(file_path)
-
-            # Skip if unchanged
-            if not force and out_path.exists():
-                existing = out_path.read_text()
-                if existing.startswith("---"):
-                    fm_section = existing.split("---")[1] if "---" in existing[3:] else ""
-                    if f"source_hash: {current_hash}" in fm_section:
-                        desc_cached += 1
-                        continue
-
-            source = file_path.read_text()
-
-            # Neighbor context
-            siblings = dir_groups.get(file_path.parent, [])
-            neighbor_ctx: dict[str, str] = {}
-            neighbor_chars = 0
-            for sib_path, sib_fs in siblings:
-                if sib_path == file_path:
-                    continue
-                sib_source = sib_path.read_text()
-                if neighbor_chars + len(sib_source) > 50_000:
-                    continue
-                neighbor_ctx[sib_fs.path] = sib_source
-                neighbor_chars += len(sib_source)
-
-            file_callers = None
-            if call_graph:
-                file_callers = call_graph.get_file_callers(rel) or None
-
-            prompt = build_prompt(
-                structure=fs,
-                source=source,
-                neighbor_context=neighbor_ctx if neighbor_ctx else None,
-                architecture_context=architecture_context,
-                project_name=proj,
-                callers=file_callers,
-            )
-
-            n_elements = count_elements(fs)
-            tokens = min(max(n_elements * 100, 4096), 16384)
-            response_text = describe_file(prompt, model_tier=model_tier, max_tokens=tokens)
-            desc = parse_response(response_text, fs)
-
-            # Continuation for missing elements
-            for _ in range(2):
-                missing = find_missing_elements(fs, desc)
-                if not missing:
-                    break
-                cont_prompt = build_continuation_prompt(
-                    structure=fs, source=source,
-                    missing=missing, project_name=proj,
-                )
-                cont_tokens = min(max(len(missing) * 100, 4096), 16384)
-                cont_text = describe_file(cont_prompt, model_tier=model_tier, max_tokens=cont_tokens)
-                cont_desc = parse_response(cont_text, fs)
-                desc.symbols.extend(cont_desc.symbols)
-
-            md = render_description_markdown(desc, source_hash=current_hash, model=model_tier)
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_text(md)
-            desc_generated += 1
-
-        dt = time.monotonic() - t0
-        parts = [f"{len(extracted)} files"]
-        if desc_cached:
-            parts.append(f"{desc_cached} cached")
-        if desc_generated:
-            parts.append(f"{desc_generated} generated")
-        click.echo("\r" + _step_line(step, n_steps, "Describe", "done",
-                                      f"{', '.join(parts)} ({dt:.1f}s)"))
-
-    # ---- Step 4: Synthesize ----
-    step = 4
     articles_dir = ck_dir / "articles"
     articles_dir.mkdir(parents=True, exist_ok=True)
     if "synthesize" in skip:
@@ -1387,7 +1274,7 @@ def update(
         for file_path, fs in extracted:
             source_hashes[fs.path] = _file_hash(file_path)
 
-        source_paths = [fs.path for _, fs in files]
+        source_paths = [fs.path for fs, _ in files]
         synth_generated = 0
         synth_cached = 0
 
@@ -1589,6 +1476,119 @@ def update(
         if not parts:
             parts.append("up to date")
         click.echo("\r" + _step_line(step, n_steps, "Synthesize", "done",
+                                      f"{', '.join(parts)} ({dt:.1f}s)"))
+
+    # ---- Step 4: Describe ----
+    step = 4
+    desc_dir = ck_dir / "descriptions"
+    desc_dir.mkdir(parents=True, exist_ok=True)
+    if "describe" in skip:
+        click.echo(_step_line(step, n_steps, "Describe", "skip", "skipped"))
+    else:
+        click.echo(_step_line(step, n_steps, "Describe", "running"), nl=False)
+        t0 = time.monotonic()
+
+        # Load architecture context (now available from synthesize step)
+        arch_dir = ck_dir / "articles"
+        architecture_context: str | None = None
+        arch_file = arch_dir / "architecture-overview.md"
+        if arch_file.is_file():
+            raw = arch_file.read_text()
+            if raw.startswith("---"):
+                end = raw.find("---", 3)
+                if end != -1:
+                    architecture_context = raw[end + 3:].strip()
+
+        # Load call graph
+        if not ("graph" in skip) and graph_dir.is_dir():
+            if "call_graph" not in dir():
+                call_graph = CallGraph.load(graph_dir)
+        elif graph_dir.is_dir():
+            call_graph = CallGraph.load(graph_dir)
+        else:
+            call_graph = None
+
+        # Group files by directory for neighbor context
+        dir_groups: dict[Path, list[tuple[Path, FileStructure]]] = {}
+        for file_path, fs in extracted:
+            dir_groups.setdefault(file_path.parent, []).append((file_path, fs))
+
+        desc_generated = 0
+        desc_cached = 0
+
+        for file_path, fs in extracted:
+            rel = fs.path
+            out_path = desc_dir / (rel + ".md")
+            current_hash = _file_hash(file_path)
+
+            # Skip if unchanged
+            if not force and out_path.exists():
+                existing = out_path.read_text()
+                if existing.startswith("---"):
+                    fm_section = existing.split("---")[1] if "---" in existing[3:] else ""
+                    if f"source_hash: {current_hash}" in fm_section:
+                        desc_cached += 1
+                        continue
+
+            source = file_path.read_text()
+
+            # Neighbor context
+            siblings = dir_groups.get(file_path.parent, [])
+            neighbor_ctx: dict[str, str] = {}
+            neighbor_chars = 0
+            for sib_path, sib_fs in siblings:
+                if sib_path == file_path:
+                    continue
+                sib_source = sib_path.read_text()
+                if neighbor_chars + len(sib_source) > 50_000:
+                    continue
+                neighbor_ctx[sib_fs.path] = sib_source
+                neighbor_chars += len(sib_source)
+
+            file_callers = None
+            if call_graph:
+                file_callers = call_graph.get_file_callers(rel) or None
+
+            prompt = build_prompt(
+                structure=fs,
+                source=source,
+                neighbor_context=neighbor_ctx if neighbor_ctx else None,
+                architecture_context=architecture_context,
+                project_name=proj,
+                callers=file_callers,
+            )
+
+            n_elements = count_elements(fs)
+            tokens = min(max(n_elements * 100, 4096), 16384)
+            response_text = describe_file(prompt, model_tier=model_tier, max_tokens=tokens)
+            desc = parse_response(response_text, fs)
+
+            # Continuation for missing elements
+            for _ in range(2):
+                missing = find_missing_elements(fs, desc)
+                if not missing:
+                    break
+                cont_prompt = build_continuation_prompt(
+                    structure=fs, source=source,
+                    missing=missing, project_name=proj,
+                )
+                cont_tokens = min(max(len(missing) * 100, 4096), 16384)
+                cont_text = describe_file(cont_prompt, model_tier=model_tier, max_tokens=cont_tokens)
+                cont_desc = parse_response(cont_text, fs)
+                desc.symbols.extend(cont_desc.symbols)
+
+            md = render_description_markdown(desc, source_hash=current_hash, model=model_tier)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(md)
+            desc_generated += 1
+
+        dt = time.monotonic() - t0
+        parts = [f"{len(extracted)} files"]
+        if desc_cached:
+            parts.append(f"{desc_cached} cached")
+        if desc_generated:
+            parts.append(f"{desc_generated} generated")
+        click.echo("\r" + _step_line(step, n_steps, "Describe", "done",
                                       f"{', '.join(parts)} ({dt:.1f}s)"))
 
     # ---- Step 5: Index ----
