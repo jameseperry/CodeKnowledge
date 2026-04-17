@@ -991,28 +991,39 @@ def index(
 
     # Build code index if configured
     if cfg and cfg.code_embedding:
-        from .index import build_code_index
+        # Free the text index's embedding model before spawning subprocess
+        from .embeddings import reset_embedder
+        reset_embedder()
+        import gc
+        gc.collect()
+        try:
+            import ctypes
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
 
         click.echo(f"\nCode embedding model: {cfg.code_embedding.model_name} ({cfg.code_embedding.backend})")
-        source_targets = cfg.resolved_source_dirs() if cfg.source_dirs else [root]
-        extracted = []
-        for t in source_targets:
-            extracted.extend(_collect_files(t, root, exclude=cfg.exclude))
 
-        if extracted:
-            file_structures = [(fs, fp.read_text()) for fp, fs in extracted]
-            code_db = ck / "codeknowledge-code.db"
-            code_result = build_code_index(
-                file_structures=file_structures,
-                db_path=code_db,
-                embedding_config=cfg.code_embedding,
-            )
-            conn = sqlite3.connect(str(code_result))
-            n_code_chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-            code_dim = conn.execute("SELECT value FROM meta WHERE key='embedding_dim'").fetchone()
-            conn.close()
-            click.echo(f"Code index built: {code_result}")
-            click.echo(f"  {n_code_chunks} chunks, {code_dim[0] if code_dim else '?'}d embeddings")
+        # Build code index in a subprocess to avoid OOM on memory-constrained
+        # systems — the text index encoding leaves glibc fragmentation that
+        # can't be reclaimed in-process.
+        import subprocess
+        result = subprocess.run(
+            [sys.executable, "-m", "codeknowledge._build_code_index",
+             str(root), str(ck)],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            # Parse output for summary line
+            for line in result.stdout.strip().splitlines():
+                click.echo(line)
+        else:
+            # Find last non-info line in stderr as the error message
+            stderr_lines = result.stderr.strip().splitlines()
+            error_lines = [l for l in stderr_lines
+                           if not l.startswith("INFO:") and not l.startswith("WARNING:")]
+            msg = error_lines[-1] if error_lines else (stderr_lines[-1] if stderr_lines else "unknown error")
+            click.echo(f"Warning: Code index build failed: {msg}", err=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1671,22 +1682,26 @@ def update(
 
         detail_parts = [f"{n_chunks} chunks · {dim}d"]
 
-        # Build code index if configured
+        # Build code index if configured — in a subprocess to avoid OOM
         if cfg and cfg.code_embedding:
-            from .index import build_code_index
-
-            code_db = ck_dir / "codeknowledge-code.db"
-            code_result = build_code_index(
-                file_structures=files,
-                db_path=code_db,
-                embedding_config=cfg.code_embedding,
+            import subprocess
+            result = subprocess.run(
+                [sys.executable, "-m", "codeknowledge._build_code_index",
+                 str(repo_root), str(ck_dir)],
+                capture_output=True, text=True,
             )
-            conn = sqlite3.connect(str(code_result))
-            n_code = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-            code_dim_row = conn.execute("SELECT value FROM meta WHERE key='embedding_dim'").fetchone()
-            conn.close()
-            code_dim = code_dim_row[0] if code_dim_row else "?"
-            detail_parts.append(f"+ {n_code} code · {code_dim}d")
+            if result.returncode == 0:
+                # Parse subprocess output for chunk count
+                for line in result.stdout.strip().splitlines():
+                    if "chunks" in line:
+                        import re
+                        m = re.search(r"(\d+) chunks.*?(\d+)d", line)
+                        if m:
+                            detail_parts.append(f"+ {m.group(1)} code · {m.group(2)}d")
+                            break
+            else:
+                log.warning("Code index subprocess failed (exit %d)", result.returncode)
+                detail_parts.append("(code index failed)")
 
         dt = time.monotonic() - t0
         click.echo("\r" + _step_line(step, n_steps, "Index", "done",

@@ -43,6 +43,33 @@ class Embedder(ABC):
         """Dimensionality of the embedding vectors."""
 
 
+def _patch_transformers_compat() -> None:
+    """Patch transformers for backward-compat with models that use removed APIs.
+
+    ``find_pruneable_heads_and_indices`` was removed in transformers 5.x.
+    Jina's custom modeling code still imports it, so we re-inject a minimal
+    implementation into ``transformers.pytorch_utils`` if it's missing.
+    """
+    import transformers.pytorch_utils as _pu
+
+    if hasattr(_pu, "find_pruneable_heads_and_indices"):
+        return
+
+    import torch
+
+    def find_pruneable_heads_and_indices(heads, n_heads, head_size, already_pruned_heads):
+        mask = torch.ones(n_heads, head_size)
+        heads = set(heads) - already_pruned_heads
+        for head in heads:
+            head = head - sum(1 if h < head else 0 for h in already_pruned_heads)
+            mask[head] = 0
+        mask = mask.view(-1).contiguous().eq(1)
+        index = torch.arange(len(mask))[mask].long()
+        return heads, index
+
+    _pu.find_pruneable_heads_and_indices = find_pruneable_heads_and_indices
+
+
 class LocalEmbedder(Embedder):
     """Embedding via a local sentence-transformers model."""
 
@@ -54,10 +81,14 @@ class LocalEmbedder(Embedder):
         if self._model is None:
             from sentence_transformers import SentenceTransformer
 
+            _patch_transformers_compat()
+
             # Suppress all logging noise during model load (HF, httpx, torch)
             root_logger = logging.getLogger()
             saved_root_level = root_logger.level
             root_logger.setLevel(logging.ERROR)
+
+            model_kwargs = {}
 
             try:
                 # Try local cache first to avoid HF network round-trips
@@ -68,6 +99,7 @@ class LocalEmbedder(Embedder):
                             self._config.model_name,
                             trust_remote_code=True,
                             local_files_only=True,
+                            model_kwargs=model_kwargs,
                         )
                     except OSError:
                         # Model not cached yet — download it
@@ -77,9 +109,15 @@ class LocalEmbedder(Embedder):
                         self._model = SentenceTransformer(
                             self._config.model_name,
                             trust_remote_code=True,
+                            model_kwargs=model_kwargs,
                         )
             finally:
                 root_logger.setLevel(saved_root_level)
+
+            # Cap sequence length to avoid O(n²) attention OOM on CPU with
+            # long inputs (e.g. large code chunks).
+            if hasattr(self._model, 'max_seq_length') and self._model.max_seq_length > 512:
+                self._model.max_seq_length = 512
 
             log.info("Embedding model loaded: %s", self._config.model_name)
 

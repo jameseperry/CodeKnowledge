@@ -35,11 +35,7 @@ class EmbeddingConfig:
 
 
 def _default_code_embedding() -> EmbeddingConfig:
-    return EmbeddingConfig(
-        model_name="jinaai/jina-embeddings-v2-base-code",
-        doc_prefix="",
-        query_prefix="",
-    )
+    return EmbeddingConfig()
 
 
 @dataclass
@@ -76,13 +72,13 @@ class Config:
         code_emb_raw = raw.get("code_embedding", {})
         code_emb = EmbeddingConfig(
             backend=code_emb_raw.get("backend", "local"),
-            model_name=code_emb_raw.get("model_name", "jinaai/jina-embeddings-v2-base-code"),
+            model_name=code_emb_raw.get("model_name", "nomic-ai/nomic-embed-text-v1.5"),
             dimensions=code_emb_raw.get("dimensions", 768),
             api_url=code_emb_raw.get("api_url", ""),
             batch_size=code_emb_raw.get("batch_size", 128),
             max_concurrent=code_emb_raw.get("max_concurrent", 4),
-            doc_prefix=code_emb_raw.get("doc_prefix", ""),
-            query_prefix=code_emb_raw.get("query_prefix", ""),
+            doc_prefix=code_emb_raw.get("doc_prefix", "search_document: "),
+            query_prefix=code_emb_raw.get("query_prefix", "search_query: "),
         )
 
         return cls(
@@ -142,9 +138,9 @@ class Config:
             data["code_embedding"]["dimensions"] = ce.dimensions
         if ce.api_url:
             data["code_embedding"]["api_url"] = ce.api_url
-        if ce.doc_prefix:
+        if ce.doc_prefix != "search_document: ":
             data["code_embedding"]["doc_prefix"] = ce.doc_prefix
-        if ce.query_prefix:
+        if ce.query_prefix != "search_query: ":
             data["code_embedding"]["query_prefix"] = ce.query_prefix
 
         config_path.write_text(yaml.dump(data, default_flow_style=False, sort_keys=False))
